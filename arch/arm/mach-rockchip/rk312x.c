@@ -90,10 +90,24 @@ static void __init rk312x_boot_mode_init(void)
 
 	if (flag == (SYS_KERNRL_REBOOT_FLAG | BOOT_RECOVER))
 		mode = BOOT_MODE_RECOVERY;
-	if (rst_st & ((1 << 2) | (1 << 3)))
+	/*
+	 * SYS_REG1 is written only by rk312x_restart(), immediately before it
+	 * issues the reset, so it names the reason for any software-initiated
+	 * reboot (PANIC included). A watchdog reset never reaches that code and
+	 * leaves the register as we cleared it at the end of the previous boot,
+	 * i.e. NORMAL. The CRU global-soft-reset status bits are set by software
+	 * resets as well, so they imply a watchdog only when no software reason
+	 * was recorded.
+	 */
+	else if (mode == BOOT_MODE_NORMAL &&
+		 (rst_st & ((1 << 2) | (1 << 3))))
 		mode = BOOT_MODE_WATCHDOG;
 
 	rockchip_boot_mode_init(flag, mode);
+
+	/* Consume the reason so the next reset cannot inherit it. */
+	writel_relaxed(BOOT_MODE_NORMAL, RK_PMU_VIRT + RK312X_PMU_SYS_REG1);
+	dsb();
 }
 
 static void usb_uart_init(void)
