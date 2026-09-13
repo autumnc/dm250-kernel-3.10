@@ -9,6 +9,7 @@ obj-$(CONFIG_SUSPEND)		+= suspend.o
 obj-$(CONFIG_PM_TEST_SUSPEND)	+= suspend_test.o
 ifeq ($(CONFIG_PM_WARP),y)
 obj-$(CONFIG_HIBERNATION)	+= warp.o snapshot.o
+obj-$(CONFIG_WARP_DIAG)		+= warp_integrity.o warp_watch.o
 else
 obj-$(CONFIG_HIBERNATION)	+= hibernate.o snapshot.o swap.o user.o \
 				   block_io.o
