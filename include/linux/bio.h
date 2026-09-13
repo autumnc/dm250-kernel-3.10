@@ -253,6 +253,11 @@ static inline struct bio *bio_clone_kmalloc(struct bio *bio, gfp_t gfp_mask)
 }
 
 extern void bio_endio(struct bio *, int);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+extern void warp_bio_check(struct bio *, const char *);
+#else
+static inline void warp_bio_check(struct bio *bio, const char *where) { }
+#endif
 struct request_queue;
 extern int bio_phys_segments(struct request_queue *, struct bio *);
 

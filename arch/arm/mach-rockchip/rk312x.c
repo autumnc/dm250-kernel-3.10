@@ -19,6 +19,7 @@
 #include <linux/init.h>
 #include <linux/irqchip.h>
 #include <linux/kernel.h>
+#include <linux/memblock.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/rockchip/common.h>
@@ -372,6 +373,11 @@ static void __init rk312x_reserve(void)
 
 	/* reserve memory for ION */
 	rockchip_ion_reserve();
+
+	/* pstore ramoops zone (survives warm reboot). Use reserve, not
+	 * remove: trimming the top of DRAM from the memory map breaks
+	 * the boot on this platform (build10/11 froze). */
+	memblock_reserve(0x9ff00000, SZ_1M);
 }
 
 #ifdef CONFIG_PM

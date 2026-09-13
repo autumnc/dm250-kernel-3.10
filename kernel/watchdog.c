@@ -28,6 +28,14 @@
 #include <asm/irq_regs.h>
 #include <linux/kvm_para.h>
 #include <linux/perf_event.h>
+#include <linux/warp_diag.h>
+
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+extern void warp_dump_cpu_timers(unsigned int cpu);
+extern unsigned int warp_phase[];
+extern u64 warp_phase_ts[];
+extern const char *warp_phase_name(unsigned int ph);
+#endif
 
 int watchdog_enabled = 1;
 int __read_mostly watchdog_thresh = 10;
@@ -224,6 +232,109 @@ static int is_hardlockup_other_cpu(unsigned int cpu)
 	return 0;
 }
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * The stuck CPU is not taking interrupts, so it cannot be IPI'd for a
+ * backtrace.  Report what it was running and scan its kernel stack for return
+ * addresses (active frames live near the top).  KERN_EMERG so the lines are
+ * printed even with a lowered console loglevel.
+ */
+static void warp_dump_one_task(unsigned int cpu, struct task_struct *p)
+{
+	struct thread_info *ti = task_thread_info(p);
+	struct pt_regs *regs;
+	unsigned long *base, *sp, *end;
+	int n = 0;
+
+	printk(KERN_EMERG "WARP-DIAG: cpu%u task=%s pid=%d state=%ld on_cpu=%d preempt=%d\n",
+		cpu, p->comm, p->pid, (long)p->state, p->on_cpu,
+		ti->preempt_count);
+	if (!p->stack)
+		return;
+
+	base = (unsigned long *)p->stack;
+	end = (unsigned long *)((unsigned long)p->stack + THREAD_SIZE);
+
+	/*
+	 * pt_regs sits at the very top of the stack and holds the *user* register
+	 * file, not a kernel frame.  Scanning down from just below it walks the
+	 * kernel call chain innermost-first; scanning from the top instead is
+	 * dominated by user/stale words and names no frame at all.
+	 */
+	regs = task_pt_regs(p);
+	if (regs && (unsigned long *)regs > base && (unsigned long *)regs <= end) {
+		printk(KERN_EMERG "WARP-DIAG: cpu%u pt_regs=%p pc=0x%08lx lr=0x%08lx sp=0x%08lx cpsr=0x%08lx\n",
+			cpu, regs, (unsigned long)regs->ARM_pc,
+			(unsigned long)regs->ARM_lr, (unsigned long)regs->ARM_sp,
+			(unsigned long)regs->ARM_cpsr);
+		sp = (unsigned long *)regs - 1;
+	} else {
+		sp = end - 1;
+	}
+
+	for (; sp >= base; sp--) {
+		if (!kernel_text_address(*sp))
+			continue;
+		printk(KERN_EMERG "WARP-DIAG: cpu%u stk+0x%lx = 0x%08lx\n",
+			cpu, (unsigned long)sp - (unsigned long)base, *sp);
+		if (++n >= 48)
+			break;
+	}
+}
+
+static void warp_dump_stuck_cpu(unsigned int cpu)
+{
+	struct task_struct *p, *idle;
+	int seen = 0;
+
+	if (cpu >= nr_cpu_ids)
+		return;
+
+#ifdef CONFIG_PM_WARP
+	{
+		unsigned int c;
+
+		/* timer-base state of every cpu: reveals a held base->lock */
+		for_each_online_cpu(c)
+			warp_dump_cpu_timers(c);
+
+		/*
+		 * Coarse phase of the stuck cpu.  age is measured off the
+		 * monotonic clock, not jiffies, because the cpu that owns the
+		 * global tick may itself be the one that is stuck.
+		 */
+		{
+			u64 ns = local_clock() - warp_phase_ts[cpu];
+
+			do_div(ns, 1000000);
+			printk(KERN_EMERG "WARP-DIAG: cpu%u phase=%s(%u) age=%lums jiffies=0x%lx\n",
+				cpu, warp_phase_name(warp_phase[cpu]),
+				warp_phase[cpu], (unsigned long)ns, jiffies);
+		}
+	}
+#endif
+
+	for_each_process(p) {
+		if (task_cpu(p) != cpu)
+			continue;
+		seen++;
+		if (p->on_cpu)
+			warp_dump_one_task(cpu, p);
+	}
+
+	/*
+	 * Idle tasks are not linked on the process list, yet a cpu that froze
+	 * while idle is running exactly one of them - so dump it unconditionally.
+	 */
+	idle = idle_task(cpu);
+	if (idle)
+		warp_dump_one_task(cpu, idle);
+
+	printk(KERN_EMERG "WARP-DIAG: cpu%u done, %d tasks on cpu\n",
+		cpu, seen);
+}
+#endif /* CONFIG_WARP_DIAG */
+
 static void watchdog_check_hardlockup_other_cpu(void)
 {
 	unsigned int next_cpu;
@@ -252,6 +363,10 @@ static void watchdog_check_hardlockup_other_cpu(void)
 		/* only warn once */
 		if (per_cpu(hard_watchdog_warn, next_cpu) == true)
 			return;
+
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		warp_dump_stuck_cpu(next_cpu);
+#endif
 
 		if (hardlockup_panic)
 			panic("Watchdog detected hard LOCKUP on cpu %u", next_cpu);

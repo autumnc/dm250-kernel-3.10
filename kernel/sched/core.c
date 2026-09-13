@@ -28,6 +28,7 @@
 
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/warp_wq.h>
 #include <linux/nmi.h>
 #include <linux/init.h>
 #include <linux/uaccess.h>
@@ -3196,9 +3197,34 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
 {
 	wait_queue_t *curr, *next;
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_wq_audit(q, "__wake_up_common");
+#endif
 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
 		unsigned flags = curr->flags;
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		/*
+		 * WARP-WQFN: the audit above validates the queue links but not
+		 * the wake function itself; a w->func overwritten with a heap
+		 * pointer would otherwise be called outright.
+		 */
+		if (unlikely(!kernel_text_address((unsigned long)curr->func))) {
+			pr_emerg("WARP-WQFN: cpu=%d q=%p curr=%p func=%p priv=%p flags=0x%x\n",
+				 smp_processor_id(), q, curr, curr->func,
+				 curr->private, curr->flags);
+			if (virt_addr_valid(curr)) {
+				print_hex_dump(KERN_EMERG, "WARP-WQFN curr: ",
+					       DUMP_PREFIX_OFFSET, 16, 4, curr,
+					       sizeof(*curr), 0);
+				list_del(&curr->task_list);
+				dump_stack();
+				continue;
+			}
+			dump_stack();
+			break;
+		}
+#endif
 		if (curr->func(curr, mode, wake_flags, key) &&
 				(flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
 			break;

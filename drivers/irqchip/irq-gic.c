@@ -606,6 +606,71 @@ static void gic_dist_restore(unsigned int gic_nr)
 #endif
 }
 
+#ifdef CONFIG_PM_WARP
+/*
+ * Diagnostic: snapshot the GIC distributor state for a hwirq (SPI).
+ * Used by the saradc driver to tell whether a cold warp restore left the
+ * interrupt enabled at the GIC level and with the right trigger/priority/target.
+ * Packed return: [0]=enable  [3:2]=config(trigger)  [15:8]=priority  [23:16]=target
+ * Returns 0xffffffff if unmappable.
+ */
+u32 gic_spi_state(u32 hwirq)
+{
+	void __iomem *dist_base = gic_data_dist_base(&gic_data[0]);
+	u32 en, cfg, pri, tgt;
+
+	if (!dist_base || hwirq < 32 || hwirq > 1020)
+		return 0xffffffff;
+
+	en = (readl_relaxed(dist_base + GIC_DIST_ENABLE_SET
+			    + (hwirq / 32) * 4) >> (hwirq % 32)) & 1;
+	cfg = (readl_relaxed(dist_base + GIC_DIST_CONFIG
+			     + (hwirq / 16) * 4) >> ((hwirq % 16) * 2)) & 3;
+	pri = (readl_relaxed(dist_base + GIC_DIST_PRI
+			     + (hwirq / 4) * 4) >> ((hwirq % 4) * 8)) & 0xff;
+	tgt = (readl_relaxed(dist_base + GIC_DIST_TARGET
+			     + (hwirq / 4) * 4) >> ((hwirq % 4) * 8)) & 0xff;
+
+	return en | (cfg << 2) | (pri << 8) | (tgt << 16);
+}
+EXPORT_SYMBOL(gic_spi_state);
+
+/*
+ * Diagnostic: GIC pending/active latch state for a hwirq (SPI).
+ * Packed: [0]=pending [1]=active.  Returns 0xffffffff if unmappable.
+ */
+u32 gic_spi_pendstate(u32 hwirq)
+{
+	void __iomem *dist_base = gic_data_dist_base(&gic_data[0]);
+	u32 p, a;
+
+	if (!dist_base || hwirq < 32 || hwirq > 1020)
+		return 0xffffffff;
+
+	p = (readl_relaxed(dist_base + GIC_DIST_PENDING_SET + (hwirq / 32) * 4)
+	     >> (hwirq % 32)) & 1;
+	a = (readl_relaxed(dist_base + GIC_DIST_ACTIVE_SET + (hwirq / 32) * 4)
+	     >> (hwirq % 32)) & 1;
+	return p | (a << 1);
+}
+EXPORT_SYMBOL(gic_spi_pendstate);
+
+/*
+ * Diagnostic: GIC CPU interface state for the calling CPU.
+ * Packed: [7:0]=GIC_CPU_CTRL [15:8]=GIC_CPU_PRIMASK
+ */
+u32 gic_cpu_state(void)
+{
+	void __iomem *cpu_base = gic_data_cpu_base(&gic_data[0]);
+
+	if (!cpu_base)
+		return 0xffffffff;
+	return (readl_relaxed(cpu_base + GIC_CPU_CTRL) & 0xff)
+	     | ((readl_relaxed(cpu_base + GIC_CPU_PRIMASK) & 0xff) << 8);
+}
+EXPORT_SYMBOL(gic_cpu_state);
+#endif
+
 static void gic_cpu_save(unsigned int gic_nr)
 {
 	int i;

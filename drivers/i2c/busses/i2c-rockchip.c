@@ -29,6 +29,8 @@
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/slab.h>
+#include <linux/irqflags.h>
+#include <linux/sched.h>
 #include <linux/io.h>
 #include <linux/mutex.h>
 #include <linux/miscdevice.h>
@@ -703,6 +705,8 @@ static int rockchip_i2c_doxfer(struct rockchip_i2c *i2c,
 				dev_err(i2c->dev, "SCL was hold by slave\n");
 			dev_err(i2c->dev, "Addr[0x%04x] wait event timeout, state: %d, is_busy: %d, error: %d, complete_what: 0x%x, ipd: 0x%x\n",
 				msgs[0].addr, i2c->state, i2c->is_busy, error, i2c->complete_what, ipd);
+			pr_emerg("WARP-DIAG: i2c timeout addr=0x%04x cpu=%d irq=%d comm=%s j=%lu\n",
+				 msgs[0].addr, raw_smp_processor_id(), irqs_disabled(), current->comm, jiffies);
 			//rockchip_show_regs(i2c);
 			error = -ETIMEDOUT;
 			mdelay(msleep_time);

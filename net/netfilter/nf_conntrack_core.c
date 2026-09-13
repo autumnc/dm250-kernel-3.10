@@ -311,6 +311,35 @@ static void death_by_timeout(unsigned long ul_conntrack)
 	nf_ct_put(ct);
 }
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+#define WARP_CT_DEBUG 1
+#else
+#define WARP_CT_DEBUG 0
+#endif
+#if WARP_CT_DEBUG
+/* Bounded dump of a conntrack hash chain, used to diagnose the runaway
+ * hlist_nulls walk.  Prints raw pointers only so it stays readable even
+ * when the chain is already corrupt. */
+static void warp_ct_dump(struct net *net, unsigned int bucket, const char *why)
+{
+	struct hlist_nulls_head *head = &net->ct.hash[bucket];
+	struct hlist_nulls_node *n = head->first;
+	int i;
+
+	pr_emerg("WARP-CT: BAD CHAIN (%s) net=%p bucket=%u head=%p first=%p\n",
+		 why, net, bucket, head, head->first);
+	for (i = 0; i < 24 && n && !is_a_nulls(n); i++) {
+		pr_emerg("WARP-CT:   [%02d] node=%p next=%p pprev=%p\n",
+			 i, n, n->next, n->pprev);
+		if (n->next == n) {
+			pr_emerg("WARP-CT:   SELF-LOOP node=%p\n", n);
+			break;
+		}
+		n = n->next;
+	}
+}
+#endif
+
 /*
  * Warning :
  * - Caller must take a reference on returned object
@@ -325,6 +354,9 @@ ____nf_conntrack_find(struct net *net, u16 zone,
 	struct nf_conntrack_tuple_hash *h;
 	struct hlist_nulls_node *n;
 	unsigned int bucket = hash_bucket(hash, net);
+#if WARP_CT_DEBUG
+	unsigned int __walk = 0, __restart = 0;
+#endif
 
 	/* Disable BHs the entire time since we normally need to disable them
 	 * at least once for the stats anyway.
@@ -332,6 +364,12 @@ ____nf_conntrack_find(struct net *net, u16 zone,
 	local_bh_disable();
 begin:
 	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[bucket], hnnode) {
+#if WARP_CT_DEBUG
+		if (unlikely(!n) || unlikely(++__walk > 4096)) {
+			warp_ct_dump(net, bucket, n ? "runaway-walk" : "null-node");
+			BUG();
+		}
+#endif
 		if (nf_ct_tuple_equal(tuple, &h->tuple) &&
 		    nf_ct_zone(nf_ct_tuplehash_to_ctrack(h)) == zone) {
 			NF_CT_STAT_INC(net, found);
@@ -347,6 +385,12 @@ begin:
 	 */
 	if (get_nulls_value(n) != bucket) {
 		NF_CT_STAT_INC(net, search_restart);
+#if WARP_CT_DEBUG
+		if (unlikely(++__restart > 4096)) {
+			warp_ct_dump(net, bucket, "runaway-restart");
+			BUG();
+		}
+#endif
 		goto begin;
 	}
 	local_bh_enable();
@@ -411,6 +455,22 @@ static void __nf_conntrack_hash_insert(struct nf_conn *ct,
 			   &net->ct.hash[hash]);
 	hlist_nulls_add_head_rcu(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode,
 			   &net->ct.hash[repl_hash]);
+#if WARP_CT_DEBUG
+	/* A node inserted twice into the same bucket makes n->next == n,
+	 * which turns every subsequent lookup of that bucket into an
+	 * unbounded walk.  Catch it at the moment it is created. */
+	if (unlikely(ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.next ==
+		     &ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode) ||
+	    unlikely(ct->tuplehash[IP_CT_DIR_REPLY].hnnode.next ==
+		     &ct->tuplehash[IP_CT_DIR_REPLY].hnnode)) {
+		pr_emerg("WARP-CT: DOUBLE-INSERT ct=%p hash=%u repl_hash=%u orig=%p reply=%p\n",
+			 ct, hash, repl_hash,
+			 ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.next,
+			 ct->tuplehash[IP_CT_DIR_REPLY].hnnode.next);
+		dump_stack();
+		BUG();
+	}
+#endif
 }
 
 int
@@ -579,12 +639,35 @@ nf_conntrack_tuple_taken(const struct nf_conntrack_tuple *tuple,
 	struct nf_conn *ct;
 	u16 zone = nf_ct_zone(ignored_conntrack);
 	unsigned int hash = hash_conntrack(net, zone, tuple);
+#if WARP_CT_DEBUG
+	unsigned int __walk = 0;
+#endif
 
 	/* Disable BHs the entire time since we need to disable them at
 	 * least once for the stats anyway.
 	 */
 	rcu_read_lock_bh();
 	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[hash], hnnode) {
+#if WARP_CT_DEBUG
+		/*
+		 * A cyclic chain (hnnode.next overwritten by the corruption)
+		 * makes this walk spin forever with BHs off -> softlockup /
+		 * hung-task (seen 2026-09-11: ping stuck here).  Bound it:
+		 * dump the bad chain (rate-limited) and treat as not-found so
+		 * the box survives instead of locking up.  Unlike the BUG()
+		 * in ____nf_conntrack_find(), this repairs rather than panics.
+		 */
+		if (unlikely(!n || ++__walk > 4096)) {
+			static unsigned long last;
+
+			if (!last || time_after(jiffies, last + HZ)) {
+				last = jiffies;
+				warp_ct_dump(net, hash,
+					     n ? "runaway-taken" : "null-node-taken");
+			}
+			break;
+		}
+#endif
 		ct = nf_ct_tuplehash_to_ctrack(h);
 		if (ct != ignored_conntrack &&
 		    nf_ct_tuple_equal(tuple, &h->tuple) &&
@@ -670,6 +753,25 @@ void init_nf_conntrack_hash_rnd(void)
 	cmpxchg(&nf_conntrack_hash_rnd, 0, rand);
 }
 
+#if WARP_CT_DEBUG
+/* Creation-time arming (experiment #91).  The reactive arm -- point the
+ * watchpoint at the word a detector just found corrupt -- never caught the
+ * writer: it writes each victim once and moves on, so the arm never sees a
+ * repeat store.  Instead arm on a write-once field of a *live* object the
+ * moment it is created, and wait for the writer to arrive.  A new conntrack's
+ * timeout.function is set exactly once by setup_timer() and never rewritten,
+ * so there is no trap storm.  Only the newest few cts are watched (WATCH_MAX
+ * is 4); a victim that has aged out is not covered, so this stays
+ * probabilistic. */
+extern void warp_ww_note_new_ct(unsigned long addr);
+static inline void warp_ct_arm_new(struct nf_conn *ct)
+{
+	warp_ww_note_new_ct((unsigned long)&ct->timeout.function);
+}
+#else
+static inline void warp_ct_arm_new(struct nf_conn *ct) { }
+#endif
+
 static struct nf_conn *
 __nf_conntrack_alloc(struct net *net, u16 zone,
 		     const struct nf_conntrack_tuple *orig,
@@ -720,6 +822,7 @@ __nf_conntrack_alloc(struct net *net, u16 zone,
 	*(unsigned long *)(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev) = hash;
 	/* Don't set timer yet: wait for confirmation */
 	setup_timer(&ct->timeout, death_by_timeout, (unsigned long)ct);
+	warp_ct_arm_new(ct);
 	write_pnet(&ct->ct_net, net);
 #ifdef CONFIG_NF_CONNTRACK_ZONES
 	if (zone) {
@@ -1071,6 +1174,93 @@ void nf_conntrack_alter_reply(struct nf_conn *ct,
 }
 EXPORT_SYMBOL_GPL(nf_conntrack_alter_reply);
 
+#if WARP_CT_DEBUG
+/* The fatal faults in this function (3 of them, all from ping) land inside
+ * the inlined atomic64 acct block, one of them as an alignment trap on a
+ * 4-but-not-8-aligned address -- i.e. the nf_conn, its timer, or its
+ * extension table was already scribbled on before we got here.  Validate the
+ * ct read-only and bail out with the writer's caller stack, but stay
+ * non-fatal so the soak keeps running. */
+extern void warp_ww_note_corruption_live(unsigned long addr);
+
+static void warp_ct_refresh_check(struct nf_conn *ct,
+				  enum ip_conntrack_info ctinfo,
+				  const struct sk_buff *skb)
+{
+	static atomic_t dumps = ATOMIC_INIT(0);
+	struct nf_ct_ext *ext;
+	unsigned long bad_addr = 0;	/* corrupted word, if we can name it */
+	int bad = 0;
+
+	if (!ct || !virt_addr_valid(ct)) {
+		pr_emerg("WARP-CTREF: bogus ct=%p ctinfo=%d skb=%p\n",
+			 ct, ctinfo, skb);
+		bad = 1;
+	} else {
+		unsigned long data = ct->timeout.data;
+		unsigned long fn = (unsigned long)ct->timeout.function;
+
+		if (data != (unsigned long)ct) {
+			pr_emerg("WARP-CTREF: ct=%p status=%lx timeout.data=%lx"
+				 " (self=%lx)\n", ct, (unsigned long)ct->status,
+				 data, (unsigned long)ct);
+			bad_addr = (unsigned long)&ct->timeout.data;
+			bad = 1;
+		}
+		if (!kernel_text_address(fn)) {
+			pr_emerg("WARP-CTREF: ct=%p timeout.function=%lx"
+				 " not in kernel text\n", ct, fn);
+			bad_addr = (unsigned long)&ct->timeout.function;
+			bad = 1;
+		}
+		/* Non-NULL entry.next means the timer is queued in a tvec
+		 * bucket -- both neighbours must be kernel addresses. */
+		if (ct->timeout.entry.next) {
+			unsigned long n = (unsigned long)ct->timeout.entry.next;
+			unsigned long p = (unsigned long)ct->timeout.entry.prev;
+
+			if (!virt_addr_valid(n) || !virt_addr_valid(p)) {
+				pr_emerg("WARP-CTREF: ct=%p queued timer"
+					 " entry next=%lx prev=%lx\n", ct, n, p);
+				bad_addr = (unsigned long)&ct->timeout.entry;
+				bad = 1;
+			}
+		}
+		ext = ct->ext;
+		if (ext) {
+			if (!virt_addr_valid(ext) || !ext->len ||
+			    ext->len > 512) {
+				pr_emerg("WARP-CTREF: ct=%p ext=%p len=%u"
+					 " (garbage)\n", ct, ext,
+					 virt_addr_valid(ext) ? ext->len : 0);
+				bad_addr = (unsigned long)&ct->ext;
+				bad = 1;
+			}
+		}
+		if (!skb || !virt_addr_valid(skb)) {
+			pr_emerg("WARP-CTREF: ct=%p bogus skb=%p\n", ct, skb);
+			bad = 1;
+		}
+	}
+
+	/* Arm the write trap on the exact corrupted word: if the writer comes
+	 * back to this still-live object, the faulting store names it. */
+	if (bad_addr)
+		warp_ww_note_corruption_live(bad_addr);
+
+	if (!bad)
+		return;
+	if (atomic_inc_return(&dumps) <= 20)
+		dump_stack();
+	else if (atomic_read(&dumps) == 21)
+		pr_emerg("WARP-CTREF: suppress further stacks\n");
+}
+#else
+static inline void warp_ct_refresh_check(struct nf_conn *ct,
+					 enum ip_conntrack_info ctinfo,
+					 const struct sk_buff *skb) { }
+#endif
+
 /* Refresh conntrack for this many jiffies and do accounting if do_acct is 1 */
 void __nf_ct_refresh_acct(struct nf_conn *ct,
 			  enum ip_conntrack_info ctinfo,
@@ -1078,6 +1268,7 @@ void __nf_ct_refresh_acct(struct nf_conn *ct,
 			  unsigned long extra_jiffies,
 			  int do_acct)
 {
+	warp_ct_refresh_check(ct, ctinfo, skb);
 	NF_CT_ASSERT(ct->timeout.data == (unsigned long)ct);
 	NF_CT_ASSERT(skb);
 

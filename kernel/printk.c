@@ -21,6 +21,7 @@
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
 #include <linux/console.h>
+#include <linux/warp_diag.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/nmi.h>
@@ -1971,6 +1972,7 @@ void console_lock(void)
 {
 	might_sleep();
 
+	WARP_PHASE(WARP_PH_CONSOLE_LOCK);
 	down(&console_sem);
 	if (console_suspended)
 		return;

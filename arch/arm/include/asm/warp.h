@@ -37,15 +37,17 @@
 
 #define WARP_SAVEAREA                                                   \
 {                                                                       \
+    /* DM250: p5 starts at device sector 0x31000; bootflag lives at    \
+     * p5 + 0x20000 bytes = sector 0x31100 (vendor bootflag confirms). */\
     .sw_bootflag.load           = WARP_LOAD_DEV,                        \
     .sw_bootflag.dev.name       = "mmcblk0p5",                          \
     .sw_bootflag.offs           = 0x00000100,                           \
     .bootflag.dev               = WARP_DEV(SD, 0, 0),                   \
     .bootflag.size              = 0x00000002,                           \
-    .bootflag.offs              = 0x0001f100,                           \
+    .bootflag.offs              = 0x00031100,                           \
     .snapshot[0].dev            = WARP_DEV(SD, 0, 0),                   \
     .snapshot[0].size           = 0x0007fefe,                           \
-    .snapshot[0].offs           = 0x0001f102,                           \
+    .snapshot[0].offs           = 0x00031102,                           \
 },
 
 #define WARP_CONSOLE    1

@@ -14,6 +14,8 @@
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/pm_runtime.h>
+#include <linux/irqflags.h>
+#include <linux/sched.h>
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
@@ -1533,12 +1535,18 @@ static int mmc_resume(struct mmc_host *host)
 {
 	int err = 0;
 
+	pr_emerg("WARP-DIAG: mmc_resume enter %s suspended=%d cpu=%d irq=%d comm=%s j=%lu\n",
+		 mmc_hostname(host), mmc_card_suspended(host->card),
+		 raw_smp_processor_id(), irqs_disabled(), current->comm, jiffies);
+
 	if (!(host->caps & MMC_CAP_RUNTIME_RESUME)) {
 		err = _mmc_resume(host);
 		pm_runtime_set_active(&host->card->dev);
 		pm_runtime_mark_last_busy(&host->card->dev);
 	}
 	pm_runtime_enable(&host->card->dev);
+	pr_emerg("WARP-DIAG: mmc_resume exit %s err=%d j=%lu\n",
+		 mmc_hostname(host), err, jiffies);
 	return err;
 }
 
@@ -1549,17 +1557,28 @@ static int mmc_shutdown(struct mmc_host *host)
 {
 	int err = 0;
 
+	pr_emerg("WARP-DIAG: mmc_shutdown enter %s cpu=%d irq=%d comm=%s j=%lu\n",
+		 mmc_hostname(host), raw_smp_processor_id(), irqs_disabled(),
+		 current->comm, jiffies);
+
 	/*
 	 * In a specific case for poweroff notify, we need to resume the card
 	 * before we can shutdown it properly.
 	 */
 	if (mmc_can_poweroff_notify(host->card) &&
-		!(host->caps2 & MMC_CAP2_FULL_PWR_CYCLE))
+		!(host->caps2 & MMC_CAP2_FULL_PWR_CYCLE)) {
+		pr_emerg("WARP-DIAG: mmc_shutdown -> mmc_resume %s j=%lu\n",
+			 mmc_hostname(host), jiffies);
 		err = mmc_resume(host);
+		pr_emerg("WARP-DIAG: mmc_shutdown resume done %s err=%d j=%lu\n",
+			 mmc_hostname(host), err, jiffies);
+	}
 
 	if (!err)
 		err = _mmc_suspend(host, false);
 
+	pr_emerg("WARP-DIAG: mmc_shutdown exit %s err=%d irq=%d j=%lu\n",
+		 mmc_hostname(host), err, irqs_disabled(), jiffies);
 	return err;
 }
 

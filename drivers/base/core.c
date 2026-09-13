@@ -26,6 +26,8 @@
 #include <linux/async.h>
 #include <linux/pm_runtime.h>
 #include <linux/netdevice.h>
+#include <linux/sched.h>
+#include <linux/irqflags.h>
 
 #include "base.h"
 #include "power/power.h"
@@ -1877,11 +1879,23 @@ void device_shutdown(void)
 		if (dev->bus && dev->bus->shutdown) {
 			if (initcall_debug)
 				dev_info(dev, "shutdown\n");
+			pr_emerg("WARP-DIAG: shutdown dev %s (bus %s) cpu=%d irq=%d comm=%s j=%lu\n",
+				 dev_name(dev), dev->bus->name,
+				 raw_smp_processor_id(), irqs_disabled(),
+				 current->comm, jiffies);
 			dev->bus->shutdown(dev);
+			pr_emerg("WARP-DIAG: shutdown dev %s done j=%lu\n",
+				 dev_name(dev), jiffies);
 		} else if (dev->driver && dev->driver->shutdown) {
 			if (initcall_debug)
 				dev_info(dev, "shutdown\n");
+			pr_emerg("WARP-DIAG: shutdown dev %s (drv %s) cpu=%d irq=%d comm=%s j=%lu\n",
+				 dev_name(dev), dev->driver->name,
+				 raw_smp_processor_id(), irqs_disabled(),
+				 current->comm, jiffies);
 			dev->driver->shutdown(dev);
+			pr_emerg("WARP-DIAG: shutdown dev %s done j=%lu\n",
+				 dev_name(dev), jiffies);
 		}
 
 		device_unlock(dev);

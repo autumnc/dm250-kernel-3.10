@@ -28,8 +28,38 @@
 #include <linux/hrtimer.h>
 #include <linux/sched/rt.h>
 #include <linux/freezer.h>
+#include <linux/mm.h>
+#include <linux/warp_wq.h>
 
 #include <asm/uaccess.h>
+#include <asm/sections.h>
+
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/* Live poll_table_entry registry; see linux/warp_wq.h. */
+static void warp_poll_register(struct poll_table_entry *e, void *wait_address);
+static void warp_poll_unregister(struct poll_table_entry *e);
+
+/*
+ * poll_wait() (linux/poll.h) calls this before p->_qproc().  _qproc must be a
+ * kernel .text function (__pollwait or ep_ptable_queue_proc) since only those
+ * are ever installed; a heap or stack value means the poll_table was stomped
+ * under us (#51 saw tmux's do_sys_poll stack pt._qproc = 0xd5d914d4, an
+ * undefined-instruction oops at a wild blx).  Reject it here so the oops names
+ * the corruption instead of the wild fetch.
+ */
+int warp_poll_qproc_bad(poll_queue_proc q)
+{
+	unsigned long a = (unsigned long)q;
+
+	if (a >= (unsigned long)_stext && a < (unsigned long)_etext)
+		return 0;
+	pr_emerg("WARP-POLL: BAD QPROC qproc=%p (not in text %p-%p)\n",
+		 q, _stext, _etext);
+	dump_stack();
+	BUG();
+	return 1;
+}
+#endif
 
 
 /*
@@ -129,6 +159,9 @@ EXPORT_SYMBOL(poll_initwait);
 static void free_poll_entry(struct poll_table_entry *entry)
 {
 	remove_wait_queue(entry->wait_address, &entry->wait);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_poll_unregister(entry);
+#endif
 	fput(entry->filp);
 }
 
@@ -214,6 +247,141 @@ static int pollwake(wait_queue_t *wait, unsigned mode, int sync, void *key)
 	return __pollwake(wait, mode, sync, key);
 }
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * WARP-POLL: live poll_table_entry registry + wait-queue audit.  See
+ * linux/warp_wq.h.  Unbounded hlist buckets keyed on the entry address keep
+ * the lookup cheap from the wake path and can never overflow.
+ */
+#define WARP_POLL_BUCKETS 8192
+
+static struct hlist_head warp_poll_tab[WARP_POLL_BUCKETS];
+static DEFINE_SPINLOCK(warp_poll_lock);
+static atomic_t warp_poll_live = ATOMIC_INIT(0);
+
+static unsigned int warp_poll_bucket(const struct poll_table_entry *e)
+{
+	unsigned long v = (unsigned long)e;
+
+	v ^= v >> 16;
+	return (v >> 6) & (WARP_POLL_BUCKETS - 1);
+}
+
+static void warp_poll_register(struct poll_table_entry *e, void *wait_address)
+{
+	unsigned long flags;
+	unsigned int b = warp_poll_bucket(e);
+
+	spin_lock_irqsave(&warp_poll_lock, flags);
+	if (!hlist_unhashed(&e->warp_node)) {
+		pr_emerg("WARP-POLL: DOUBLE REGISTER entry=%p wa=%p\n", e, wait_address);
+		dump_stack();
+	} else {
+		hlist_add_head(&e->warp_node, &warp_poll_tab[b]);
+		atomic_inc(&warp_poll_live);
+	}
+	spin_unlock_irqrestore(&warp_poll_lock, flags);
+}
+
+static void warp_poll_unregister(struct poll_table_entry *e)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&warp_poll_lock, flags);
+	if (!hlist_unhashed(&e->warp_node)) {
+		hlist_del_init(&e->warp_node);
+		atomic_dec(&warp_poll_live);
+	}
+	spin_unlock_irqrestore(&warp_poll_lock, flags);
+}
+
+static int warp_poll_is_live(struct poll_table_entry *e)
+{
+	unsigned long flags;
+	unsigned int b = warp_poll_bucket(e);
+	struct poll_table_entry *pos;
+	int found = 0;
+
+	spin_lock_irqsave(&warp_poll_lock, flags);
+	hlist_for_each_entry(pos, &warp_poll_tab[b], warp_node) {
+		if (pos == e) {
+			found = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&warp_poll_lock, flags);
+	return found;
+}
+
+static void warp_poll_dump_state(void)
+{
+	unsigned long flags;
+	unsigned int b;
+	struct poll_table_entry *pos;
+
+	pr_emerg("WARP-POLL: live=%d\n", atomic_read(&warp_poll_live));
+	spin_lock_irqsave(&warp_poll_lock, flags);
+	for (b = 0; b < WARP_POLL_BUCKETS; b++)
+		hlist_for_each_entry(pos, &warp_poll_tab[b], warp_node)
+			pr_emerg("WARP-POLL:   live entry=%p wa=%p filp=%p\n",
+				 pos, pos->wait_address, pos->filp);
+	spin_unlock_irqrestore(&warp_poll_lock, flags);
+}
+
+void warp_wq_audit(wait_queue_head_t *q, const char *where)
+{
+	struct list_head *head, *pos;
+	unsigned long cnt = 0;
+
+	if (!q || !virt_addr_valid(q))
+		return;
+	head = &q->task_list;
+	if (!virt_addr_valid(head->next) || !virt_addr_valid(head->prev)) {
+		pr_emerg("WARP-POLL: BAD HEAD PTR q=%p (%s) next=%p prev=%p\n",
+			 q, where, head->next, head->prev);
+		dump_stack();
+		BUG();
+	}
+	if (head->next->prev != head || head->prev->next != head) {
+		pr_emerg("WARP-POLL: BAD HEAD LINK q=%p (%s) head=%p next=%p next->prev=%p prev=%p prev->next=%p\n",
+			 q, where, head, head->next, head->next->prev,
+			 head->prev, head->prev->next);
+		warp_poll_dump_state();
+		dump_stack();
+		BUG();
+	}
+	for (pos = head->next; pos != head; pos = pos->next) {
+		wait_queue_t *w = container_of(pos, wait_queue_t, task_list);
+		struct poll_table_entry *e =
+			container_of(w, struct poll_table_entry, wait);
+
+		if (!virt_addr_valid(pos) || !virt_addr_valid(pos->next) ||
+		    pos->next->prev != pos) {
+			pr_emerg("WARP-POLL: BAD NODE LINK q=%p (%s) node=%p\n",
+				 q, where, pos);
+			warp_poll_dump_state();
+			dump_stack();
+			BUG();
+		}
+		if ((unsigned long)w->func == (unsigned long)pollwake &&
+		    !warp_poll_is_live(e)) {
+			pr_emerg("WARP-POLL: DANGLING POLL ENTRY q=%p (%s) entry=%p wait=%p func=%p priv=%p flip=%p wa=%p\n",
+				 q, where, e, w, w->func, w->private,
+				 e->filp, e->wait_address);
+			warp_poll_dump_state();
+			dump_stack();
+			BUG();
+		}
+		if (++cnt > 4096) {
+			pr_emerg("WARP-POLL: LOOP q=%p (%s) at %p\n", q, where, pos);
+			warp_poll_dump_state();
+			dump_stack();
+			BUG();
+		}
+	}
+}
+#endif /* CONFIG_PM_WARP */
+
 /* Add a new entry */
 static void __pollwait(struct file *filp, wait_queue_head_t *wait_address,
 				poll_table *p)
@@ -227,6 +395,13 @@ static void __pollwait(struct file *filp, wait_queue_head_t *wait_address,
 	entry->key = p->_key;
 	init_waitqueue_func_entry(&entry->wait, pollwake);
 	entry->wait.private = pwq;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	/* Register before linking so a concurrent wake already sees it live.
+	 * The audit runs under the queue lock from the wake/remove paths, where
+	 * the list is stable. */
+	INIT_HLIST_NODE(&entry->warp_node);
+	warp_poll_register(entry, wait_address);
+#endif
 	add_wait_queue(wait_address, &entry->wait);
 }
 

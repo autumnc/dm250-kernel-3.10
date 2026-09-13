@@ -47,6 +47,11 @@
 
 struct rk818 *g_rk818;
 
+/* warp cold-resume: 1 = warp_rk818_resume() (machine HAL) already performed
+ * rk818 cold-start pre_init + pm_regs restore; 0 = PMIC never lost power so
+ * HAL skipped and the dpm-side rk818_resume() is the only configurer. */
+int warp_pmic_cold_started;
+
 static struct mfd_cell rk818s[] = {
 	{
 		.name = "rk818-rtc",
@@ -1157,8 +1162,16 @@ void warp_rk818_resume (void)
 {
 	struct rk818 *rk818 = g_rk818;
 	u8 regs;
+	int sts;
 
-  if( (rk818_reg_read( rk818, RK818_RTC_STATUS_REG ) & RK818_RTC_STATUS_MASK_POWER_UP) != 0 )
+	sts = rk818_reg_read( rk818, RK818_RTC_STATUS_REG );
+	warp_pmic_cold_started = (sts & RK818_RTC_STATUS_MASK_POWER_UP) ? 1 : 0;
+	printk( KERN_INFO "warp_rk818_resume(): RTC_STATUS=0x%02x cold_started=%d -> %s\n",
+		sts & 0xff, warp_pmic_cold_started,
+		warp_pmic_cold_started ? "HAL pre_init+pm_regs restore DONE" :
+		"HAL skipped (PMIC stayed powered), dpm rk818_resume must configure" );
+
+  if( warp_pmic_cold_started )
   {
 	printk( KERN_INFO "%s() : RK818 cold reset has been detected, default initialize sequence in Warp image.\n", __FUNCTION__ );
 
@@ -1311,14 +1324,27 @@ static int rk818_resume(struct i2c_client *i2c)
 		int i;
 		struct regulator_dev *rk818_rdev;
 
-		ret = rk818_reg_read(rk818,0x2f);
-		if ((ret < 0) || (ret == 0xff)){
-			printk("The device is not rk818 %d\n",ret);
-		}
+		if (!warp_pmic_cold_started) {
+			/* HAL skipped cold config (PMIC stayed powered). This dpm
+			 * rk818_resume is the only chance to bring rails back. */
+			printk("warp: rk818_resume pm_device_down, cold_started=0 -> run pre_init\n");
+			ret = rk818_reg_read(rk818,0x2f);
+			if ((ret < 0) || (ret == 0xff)){
+				printk("The device is not rk818 %d\n",ret);
+			}
 
-		ret = rk818_pre_init(rk818);
-		if (ret < 0){
-			printk("The rk818_pre_init failed %d\n",ret);
+			ret = rk818_pre_init(rk818);
+			if (ret < 0){
+				printk("The rk818_pre_init failed %d\n",ret);
+			} else {
+				printk("warp: dpm rk818_pre_init OK ret=%d\n",ret);
+			}
+		} else {
+			/* warp_rk818_resume (machine HAL) already did pre_init +
+			 * full pm_regs restore right after CRU/GRF restore. Re-running
+			 * pre_init here re-writes DCDC_EN (0x23) on a rail that is
+			 * already up -> observed -110 / bus hang. Skip it. */
+			printk("warp: rk818_resume pm_device_down, cold_started=1 -> skip redundant pre_init\n");
 		}
 		regulator_suspend_finish();
 }

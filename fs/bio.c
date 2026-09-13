@@ -51,6 +51,64 @@ static struct biovec_slab bvec_slabs[BIOVEC_NR_POOLS] __read_mostly = {
 };
 #undef BV
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+extern char _stext[], _etext[];
+
+static int warp_addr_ok(unsigned long p)
+{
+	if (p >= (unsigned long)_stext && p < (unsigned long)_etext)
+		return 1;
+	if (p >= 0xbf000000UL && p < 0xc0000000UL)	/* modules */
+		return 1;
+	return 0;
+}
+
+/*
+ * WARP-BIO: structural sanity check for a struct bio.  Dumps the full
+ * object state and BUG()s when the pointer is clearly not a live bio.
+ * Catches the wild/corrupt bio seen freed with a bogus pointer out of
+ * ext4_end_bio (build #47).  Cheap enough to run on every completion.
+ */
+void warp_bio_check(struct bio *bio, const char *where)
+{
+	unsigned long a = (unsigned long)bio;
+	int bad = 0;
+
+	if (!bio || (a & 3) || !virt_addr_valid(bio))
+		bad = 1;
+	else {
+		unsigned long eio = (unsigned long)bio->bi_end_io;
+		unsigned long pool = (unsigned long)bio->bi_pool;
+		int cnt = atomic_read(&bio->bi_cnt);
+
+		if (eio && !warp_addr_ok(eio))
+			bad = 1;
+		if (pool && !virt_addr_valid((void *)pool))
+			bad = 1;
+		if (cnt <= 0 || cnt > 0x10000)
+			bad = 1;
+	}
+
+	if (unlikely(bad)) {
+		if (virt_addr_valid(bio))
+			pr_emerg("WARP-BIO[%s]: BAD bio=%p cnt=%d pool=%p end_io=%p flags=0x%lx size=%u vcnt=%u max=%u priv=%p sec=%llu\n",
+				 where, bio, atomic_read(&bio->bi_cnt), bio->bi_pool,
+				 (void *)bio->bi_end_io, bio->bi_flags, bio->bi_size,
+				 bio->bi_vcnt, bio->bi_max_vecs, bio->bi_private,
+				 (unsigned long long)bio->bi_sector);
+		else
+			pr_emerg("WARP-BIO[%s]: BAD bio=%p (not a valid kernel address)\n",
+				 where, bio);
+		if (virt_addr_valid(bio))
+			print_hex_dump(KERN_ERR, "WARP-BIO: ", DUMP_PREFIX_OFFSET,
+				       16, 4, bio, sizeof(struct bio), 0);
+		dump_stack();
+		BUG();
+	}
+}
+EXPORT_SYMBOL(warp_bio_check);
+#endif
+
 /*
  * fs_bio_set is the bio_set containing bio and iovec memory pools used by
  * IO code that does not need private memory pools.
@@ -495,6 +553,9 @@ EXPORT_SYMBOL(zero_fill_bio);
  **/
 void bio_put(struct bio *bio)
 {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_bio_check(bio, "bio_put");
+#endif
 	BIO_BUG_ON(!atomic_read(&bio->bi_cnt));
 
 	/*
@@ -1711,6 +1772,9 @@ EXPORT_SYMBOL(bio_flush_dcache_pages);
  **/
 void bio_endio(struct bio *bio, int error)
 {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_bio_check(bio, "bio_endio");
+#endif
 	if (error)
 		clear_bit(BIO_UPTODATE, &bio->bi_flags);
 	else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))

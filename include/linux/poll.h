@@ -39,10 +39,23 @@ typedef struct poll_table_struct {
 	unsigned long _key;
 } poll_table;
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG) && !defined(MODULE)
+extern int warp_poll_qproc_bad(poll_queue_proc q);
+#endif
+
 static inline void poll_wait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
 {
-	if (p && p->_qproc && wait_address)
+	if (p && p->_qproc && wait_address) {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG) && !defined(MODULE)
+		/* _qproc is always a .text function (__pollwait /
+		 * ep_ptable_queue_proc) or NULL; anything else means the
+		 * poll_table was stomped. Catch it here so the oops names the
+		 * real fault instead of a wild blx. */
+		if (warp_poll_qproc_bad(p->_qproc))
+			return;
+#endif
 		p->_qproc(filp, wait_address, p);
+	}
 }
 
 /*
@@ -77,6 +90,9 @@ struct poll_table_entry {
 	unsigned long key;
 	wait_queue_t wait;
 	wait_queue_head_t *wait_address;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	struct hlist_node warp_node;
+#endif
 };
 
 /*

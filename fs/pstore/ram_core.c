@@ -25,6 +25,7 @@
 #include <linux/vmalloc.h>
 #include <linux/pstore_ram.h>
 #include <asm/page.h>
+#include <asm/cacheflush.h>
 
 struct persistent_ram_buffer {
 	uint32_t    sig;
@@ -253,6 +254,7 @@ static void notrace persistent_ram_update(struct persistent_ram_zone *prz,
 {
 	struct persistent_ram_buffer *buffer = prz->buffer;
 	memcpy(buffer->data + start, s, count);
+	clean_dcache_area(buffer->data + start, count);
 	persistent_ram_update_ecc(prz, start, count);
 }
 
@@ -285,6 +287,7 @@ int notrace persistent_ram_write(struct persistent_ram_zone *prz,
 	int rem;
 	int c = count;
 	size_t start;
+	struct persistent_ram_buffer *buffer = prz->buffer;
 
 	if (unlikely(c > prz->buffer_size)) {
 		s += c - prz->buffer_size;
@@ -305,6 +308,7 @@ int notrace persistent_ram_write(struct persistent_ram_zone *prz,
 	persistent_ram_update(prz, s, start, c);
 
 	persistent_ram_update_header_ecc(prz);
+	clean_dcache_area(buffer, sizeof(*buffer));
 
 	return count;
 }
@@ -331,6 +335,7 @@ void persistent_ram_zap(struct persistent_ram_zone *prz)
 	atomic_set(&prz->buffer->start, 0);
 	atomic_set(&prz->buffer->size, 0);
 	persistent_ram_update_header_ecc(prz);
+	clean_dcache_area(prz->buffer, sizeof(*prz->buffer));
 }
 
 static void *persistent_ram_vmap(phys_addr_t start, size_t size)
@@ -345,7 +350,11 @@ static void *persistent_ram_vmap(phys_addr_t start, size_t size)
 	page_start = start - offset_in_page(start);
 	page_count = DIV_ROUND_UP(size + offset_in_page(start), PAGE_SIZE);
 
-	prot = pgprot_noncached(PAGE_KERNEL);
+	/* Normal cacheable mapping, not pgprot_noncached: strongly-ordered
+	 * mappings break on this platform (unaligned memcpy from printk /
+	 * panic context). Writes are pushed to DRAM via clean_dcache_area
+	 * so they survive warm reboot. */
+	prot = PAGE_KERNEL;
 
 	pages = kmalloc(sizeof(struct page *) * page_count, GFP_KERNEL);
 	if (!pages) {
@@ -416,18 +425,19 @@ static int persistent_ram_post_init(struct persistent_ram_zone *prz, u32 sig,
 				" size %zu, start %zu\n",
 			       buffer_size(prz), buffer_start(prz));
 		else {
-			pr_debug("persistent_ram: found existing buffer,"
+			pr_info("persistent_ram: found existing buffer,"
 				" size %zu, start %zu\n",
 			       buffer_size(prz), buffer_start(prz));
 			persistent_ram_save_old(prz);
 			return 0;
 		}
 	} else {
-		pr_debug("persistent_ram: no valid data in buffer"
+		pr_info("persistent_ram: no valid data in buffer"
 			" (sig = 0x%08x)\n", prz->buffer->sig);
 	}
 
 	prz->buffer->sig = sig;
+	clean_dcache_area(&prz->buffer->sig, 4);
 	persistent_ram_zap(prz);
 
 	return 0;

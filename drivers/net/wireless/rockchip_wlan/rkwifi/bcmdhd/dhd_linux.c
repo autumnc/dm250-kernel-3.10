@@ -1196,6 +1196,86 @@ int dhd_bssidx2idx(dhd_pub_t *dhdp, uint32 bssidx)
 	return i;
 }
 
+#ifdef CONFIG_WARP_DIAG
+/* ================================ WARP-SKB ==============================
+ * Catch corruption of a live sk_buff as it traverses bcmdhd's RX handoff path.
+ *
+ * skbuff_head_cache geometry (verified for this build):
+ *   object_size=192  slab_size=384  flags = POISON|RED_ZONE|STORE_USER
+ * SLUB fills each fresh slab page with POISON_INUSE (0x5a); its init_object()
+ * only rewrites [0,inuse) of an object, so the trailing 24 bytes of every
+ * 384-byte slot (offsets 360..383) stay 0x5a for the object's whole lifetime.
+ * Any other byte there == an out-of-bounds write into this sk_buff (the
+ * "padding overwritten" class of bug).  A freed sk_buff instead shows
+ * POISON_FREE (0x6b) / POISON_INUSE (0x5a) in its own fields -> UAF.
+ * ======================================================================== */
+#define WARP_SKB_SLOT     384
+#define WARP_SKB_PAD_OFF  360
+#define WARP_SKB_PAD_LEN  24
+#define WARP_KPTR_MIN     0xC0000000u
+
+static unsigned long warp_skb_hits;
+static int warp_skb_geom_dumped;
+
+static inline int warp_skb_poison(u32 v)
+{
+	return v == 0x5a5a5a5au || v == 0x6b6b6b6bu || v == 0xdead4eadu;
+}
+
+static void warp_skb_check(const void *skb, const char *tag)
+{
+	const struct sk_buff *s = (const struct sk_buff *)skb;
+	const u8 *p = (const u8 *)skb;
+	u32 nxt, hd, dt;
+	int i, bad = -1;
+
+	if (skb == NULL)
+		return;
+	if ((u32)(unsigned long)skb < WARP_KPTR_MIN) {
+		pr_emerg("WARP-SKB: %s skb=%p BAD-PTR\n", tag, skb);
+		return;
+	}
+	if (warp_skb_hits > 64)
+		return;
+
+	if (!warp_skb_geom_dumped) {
+		warp_skb_geom_dumped = 1;
+		pr_emerg("WARP-SKB: geom sizeof_skb=%d rzone@192=%02x%02x%02x%02x "
+			 "pad@360=%08x %08x %08x %08x %08x %08x\n",
+			 (int)sizeof(struct sk_buff),
+			 p[192], p[193], p[194], p[195],
+			 *(const u32 *)(p + 360), *(const u32 *)(p + 364),
+			 *(const u32 *)(p + 368), *(const u32 *)(p + 372),
+			 *(const u32 *)(p + 376), *(const u32 *)(p + 380));
+	}
+
+	for (i = 0; i < WARP_SKB_PAD_LEN; i++) {
+		if (p[WARP_SKB_PAD_OFF + i] != 0x5a) {
+			bad = i;
+			break;
+		}
+	}
+
+	nxt = (u32)(unsigned long)s->next;
+	hd  = (u32)(unsigned long)s->head;
+	dt  = (u32)(unsigned long)s->data;
+
+	if (bad >= 0 || warp_skb_poison(nxt) || warp_skb_poison(hd) ||
+	    warp_skb_poison(dt)) {
+		warp_skb_hits++;
+		pr_emerg("WARP-SKB: %s skb=%p oob@+%d next=%08x head=%08x data=%08x "
+			 "len=%u pad=%08x %08x %08x %08x %08x %08x\n",
+			 tag, skb, bad >= 0 ? WARP_SKB_PAD_OFF + bad : -1,
+			 nxt, hd, dt, s->len,
+			 *(const u32 *)(p + 360), *(const u32 *)(p + 364),
+			 *(const u32 *)(p + 368), *(const u32 *)(p + 372),
+			 *(const u32 *)(p + 376), *(const u32 *)(p + 380));
+		if (warp_skb_hits == 64)
+			pr_emerg("WARP-SKB: 64 hits, muting\n");
+	}
+}
+#endif /* CONFIG_WARP_DIAG */
+
 static inline int dhd_rxf_enqueue(dhd_pub_t *dhdp, void* skb)
 {
 	uint32 store_idx;
@@ -1205,6 +1285,10 @@ static inline int dhd_rxf_enqueue(dhd_pub_t *dhdp, void* skb)
 		DHD_ERROR(("dhd_rxf_enqueue: NULL skb!!!\n"));
 		return BCME_ERROR;
 	}
+
+#ifdef CONFIG_WARP_DIAG
+	warp_skb_check(skb, "rxf-enq");
+#endif
 
 	dhd_os_rxflock(dhdp);
 	store_idx = dhdp->store_idx;
@@ -1263,6 +1347,10 @@ static inline void* dhd_rxf_dequeue(dhd_pub_t *dhdp)
 		skb, sent_idx));
 
 	dhd_os_rxfunlock(dhdp);
+
+#ifdef CONFIG_WARP_DIAG
+	warp_skb_check(skb, "rxf-deq");
+#endif
 
 	return skb;
 }
@@ -2790,6 +2878,10 @@ dhd_rx_frame(dhd_pub_t *dhdp, int ifidx, void *pktbuf, int numpkt, uint8 chan)
 		}
 #endif /* DHD_TCP_WINSIZE_ADJUST */
 
+#ifdef CONFIG_WARP_DIAG
+		warp_skb_check(skb, "rxframe");
+#endif
+
 		if (in_interrupt()) {
 			netif_rx(skb);
 		} else {
@@ -3124,6 +3216,9 @@ dhd_rxf_thread(void *data)
 				void *skbnext = PKTNEXT(pub->osh, skb);
 				PKTSETNEXT(pub->osh, skb, NULL);
 
+#ifdef CONFIG_WARP_DIAG
+				warp_skb_check(skb, "rxf-tx");
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
 				netif_rx_ni(skb);
 #else
@@ -3237,6 +3332,9 @@ dhd_sched_rxf(dhd_pub_t *dhdp, void *skb)
 		while (skbp) {
 			void *skbnext = PKTNEXT(dhdp->osh, skbp);
 			PKTSETNEXT(dhdp->osh, skbp, NULL);
+	#ifdef CONFIG_WARP_DIAG
+		warp_skb_check(skbp, "sched-fb");
+#endif
 			netif_rx_ni(skbp);
 			skbp = skbnext;
 		}

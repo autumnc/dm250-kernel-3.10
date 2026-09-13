@@ -549,6 +549,38 @@ static void print_page_info(struct page *page)
 
 }
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * WARP-SLUB: when a free is rejected, dump enough to tell whether the
+ * *object* pointer is bad or the *cache* descriptor passed by the caller
+ * is bad.  In build #47 the "BUG %s (Not tainted)" line printed an empty
+ * cache name, which points at a garbage `s`.
+ */
+static void warp_slub_dump(struct kmem_cache *s, struct page *page, const void *object)
+{
+	struct kmem_cache *pc = page->slab_cache;
+	unsigned long base = (unsigned long)page_address(page);
+	unsigned long off = (unsigned long)object - base;
+
+	pr_emerg("WARP-SLUB: s=%p name='%s' size=%d obj_size=%d inuse=%d off=%d flags=0x%lx\n",
+		 s, (s && s->name) ? s->name : "(null)", s->size, s->object_size,
+		 s->inuse, s->offset, s->flags);
+	pr_emerg("WARP-SLUB: page=%p pbase=%p p->slab_cache=%p pc->name='%s' objs=%u inuse=%u fp=%p\n",
+		 page, (void *)base, pc,
+		 (virt_addr_valid(pc) && pc->name) ? pc->name : "(?)",
+		 page->objects, page->inuse, page->freelist);
+	pr_emerg("WARP-SLUB: object=%p off=0x%lx %%size=%lu inrange=%d\n",
+		 object, off, s->size ? (off % (unsigned long)s->size) : 0,
+		 (off < (unsigned long)page->objects * (unsigned long)s->size));
+	if (virt_addr_valid(object))
+		print_hex_dump(KERN_ERR, "WARP-SLUB: ", DUMP_PREFIX_OFFSET,
+			       16, 4, object, 32, 0);
+}
+#else
+static inline void warp_slub_dump(struct kmem_cache *s, struct page *page,
+				  const void *object) { }
+#endif
+
 static void slab_bug(struct kmem_cache *s, char *fmt, ...)
 {
 	va_list args;
@@ -653,6 +685,11 @@ static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
 	memset(from, data, to - from);
 }
 
+#ifdef CONFIG_WARP_DIAG
+/* WARP: hand the corrupted byte address to the write-watchpoint roller. */
+extern void warp_ww_note_corruption(unsigned long addr);
+#endif
+
 static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 			u8 *object, char *what,
 			u8 *start, unsigned int value, unsigned int bytes)
@@ -671,6 +708,11 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 	slab_bug(s, "%s overwritten", what);
 	printk(KERN_ERR "INFO: 0x%p-0x%p. First byte 0x%x instead of 0x%x\n",
 					fault, end - 1, fault[0], value);
+#ifdef CONFIG_WARP_DIAG
+	/* Point the hardware watchpoint at the freshly corrupted word so the
+	 * writer's next store to it traps. */
+	warp_ww_note_corruption((unsigned long)fault);
+#endif
 	print_trailer(s, page, object);
 
 	restore_bytes(s, what, value, fault, end);
@@ -1120,6 +1162,7 @@ out:
 fail:
 	slab_unlock(page);
 	spin_unlock_irqrestore(&n->list_lock, *flags);
+	warp_slub_dump(s, page, object);
 	slab_fix(s, "Object at 0x%p not freed", object);
 	return NULL;
 }

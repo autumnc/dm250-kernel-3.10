@@ -128,6 +128,17 @@ static void bounce_end_io(struct bio *bio, mempool_t *pool, int err)
 	struct bio_vec *bvec, *org_vec;
 	int i;
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	/*
+	 * WARP-BIO: the original bio is carried in bi_private.  If the bounce
+	 * bio itself was double-completed / reused, bi_private is garbage and
+	 * the subsequent bio_endio(bio_orig) frees a wild pointer (seen in
+	 * build #47: kmem_cache_free from ext4_end_bio+0x238 <- bounce_end_io).
+	 */
+	warp_bio_check(bio, "bounce_end_io/bio");
+	warp_bio_check(bio_orig, "bounce_end_io/bio_orig");
+#endif
+
 	if (test_bit(BIO_EOPNOTSUPP, &bio->bi_flags))
 		set_bit(BIO_EOPNOTSUPP, &bio_orig->bi_flags);
 

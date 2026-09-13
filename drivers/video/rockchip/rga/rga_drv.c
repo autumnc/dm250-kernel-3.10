@@ -1214,7 +1214,7 @@ static int rga_release(struct inode *inode, struct file *file)
     {
 		pr_err("rga_service session %d still has %d task running when closing\n", session->pid, task_running);
 		msleep(100);
-        /*Í¬²½*/
+        /*Í¬ï¿½ï¿½*/
 	}
 
 	wake_up(&session->wait);
@@ -1441,6 +1441,14 @@ static int __init rga_init(void)
 
     rga_mmu_buf.pages = kmalloc((32768)* sizeof(struct page *), GFP_KERNEL);
 
+    /* The cmd reg pool is normally allocated by the fb layer on the
+     * RK_FB_VIDEO_INIT ioctl; on a plain console nobody issues that, so
+     * self-init here to make standalone /dev/rga ioctl blits work. */
+    if ((ret = cmd_reg_memory_init(8)) != 0) {
+        printk(KERN_ERR "RGA cmd reg init failed.\n");
+        return ret;
+    }
+
 	if ((ret = platform_driver_register(&rga_driver)) != 0)
 	{
         printk(KERN_ERR "Platform device register failed (%d).\n", ret);
@@ -1500,6 +1508,8 @@ static void __exit rga_exit(void)
 
     if (rga_mmu_buf.pages)
         kfree(rga_mmu_buf.pages);
+
+    cmd_reg_memory_exit();
 
 	platform_driver_unregister(&rga_driver);
 }

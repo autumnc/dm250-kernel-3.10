@@ -111,6 +111,9 @@ obj-$(CONFIG_CRASH_DUMP) += crash_dump.o
 obj-$(CONFIG_JUMP_LABEL) += jump_label.o
 obj-$(CONFIG_CONTEXT_TRACKING) += context_tracking.o
 
+obj-$(CONFIG_WARP_DIAG) += rk312x_wdt.o
+obj-$(CONFIG_WARP_DIAG) += hardlock_test.o
+
 $(obj)/configs.o: $(obj)/config_data.h
 
 # config_data.h contains the same information as ikconfig.h but gzipped.

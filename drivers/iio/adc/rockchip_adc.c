@@ -37,6 +37,11 @@
 #include <linux/iio/machine.h>
 #include <linux/iio/driver.h>
 
+#ifdef CONFIG_PM_WARP
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#endif
+
 
 #if 0
 #define RK_ADC_DBG(x...)		\
@@ -103,6 +108,39 @@ static void rk_adc_dump(struct iio_dev *indio_dev)
                         readl_relaxed(info->regs + 0x0c));
 }
 
+#ifdef CONFIG_PM_WARP
+extern u32 gic_spi_state(u32 hwirq);
+extern u32 gic_spi_pendstate(u32 hwirq);
+extern u32 gic_cpu_state(void);
+static int rk_adc_diag_n;
+
+/*
+ * Diagnostic for the cold warp restore: reports whether the saradc interrupt
+ * is enabled at the linux irq layer (depth/masked), at the GIC distributor
+ * (enable bit + trigger config + priority + target) and whether it is stuck
+ * pending/active in the distributor, plus the GIC CPU interface state.
+ */
+static void rk_adc_irq_diag(const char *where, struct rk_adc *info)
+{
+	struct irq_desc *d = irq_to_desc(info->irq);
+	struct irq_data *id = irq_get_irq_data(info->irq);
+	u32 hw = id ? (u32)id->hwirq : 0xffffffff;
+	u32 gs = gic_spi_state(hw);
+	u32 ps = gic_spi_pendstate(hw);
+	u32 cs = gic_cpu_state();
+
+	pr_info("rk_adc-diag[%s]: irq=%u hwirq=%u depth=%d masked=%d gic_en=%u cfg=%u pri=%02x tgt=%02x pend=%u act=%u cpu_ctl=%02x cpu_pm=%02x state=0x%lx ctrl=0x%08x\n",
+		where, info->irq, hw,
+		d ? d->depth : -1,
+		d ? (int)irqd_irq_masked(&d->irq_data) : -1,
+		gs & 1, (gs >> 2) & 3, (gs >> 8) & 0xff, (gs >> 16) & 0xff,
+		ps & 1, (ps >> 1) & 1,
+		cs & 0xff, (cs >> 8) & 0xff,
+		d ? (unsigned long)d->irq_data.state_use_accessors : 0UL,
+		readl_relaxed(info->regs + ADC_CTRL));
+}
+#endif
+
 static int rk_read_raw(struct iio_dev *indio_dev,
 				struct iio_chan_spec const *chan,
 				int *val,
@@ -135,6 +173,11 @@ static int rk_read_raw(struct iio_dev *indio_dev,
 	if (timeout == 0)
 	{
 		rk_adc_dump(indio_dev);
+#ifdef CONFIG_PM_WARP
+		if (rk_adc_diag_n < 3 || (rk_adc_diag_n % 100) == 0)
+			rk_adc_irq_diag("timeout", info);
+		rk_adc_diag_n++;
+#endif
 		writel_relaxed(0, info->regs + ADC_CTRL);
 		writel_relaxed(0, info->regs + ADC_DELAY_PU_SOC);
 		ret = -ETIMEDOUT;
@@ -394,7 +437,9 @@ static int rk_adc_resume(struct device *dev)
 		writel_relaxed(pm_regs[1], info->regs + ADC_DELAY_PU_SOC);
 		clk_disable(info->clk);
 		clk_disable(info->pclk);
+		rk_adc_irq_diag("resume-pre", info);
 		enable_irq(info->irq);
+		rk_adc_irq_diag("resume-post", info);
 	}
 #endif
 	return ret;

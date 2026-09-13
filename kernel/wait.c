@@ -9,6 +9,7 @@
 #include <linux/mm.h>
 #include <linux/wait.h>
 #include <linux/hash.h>
+#include <linux/warp_wq.h>
 
 void __init_waitqueue_head(wait_queue_head_t *q, const char *name, struct lock_class_key *key)
 {
@@ -46,6 +47,9 @@ void remove_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
 	unsigned long flags;
 
 	spin_lock_irqsave(&q->lock, flags);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_wq_audit(q, "remove_wait_queue");
+#endif
 	__remove_wait_queue(q, wait);
 	spin_unlock_irqrestore(&q->lock, flags);
 }

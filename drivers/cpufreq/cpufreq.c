@@ -1377,6 +1377,9 @@ void cpufreq_suspend(void)
  * Called during system wide Suspend/Hibernate cycle for resuming governors that
  * are suspended with cpufreq_suspend().
  */
+#ifdef CONFIG_PM_WARP
+extern int warp_stat;
+#endif
 void cpufreq_resume(void)
 {
 	struct cpufreq_policy *policy;
@@ -1391,6 +1394,24 @@ void cpufreq_resume(void)
 	pr_debug("%s: Resuming Governors\n", __func__);
 
 	cpufreq_suspended = false;
+
+#ifdef CONFIG_PM_WARP
+	if (warp_stat) {
+		/*
+		 * Cold warp restore: the CPUs were freshly re-booted by the
+		 * loader while the governor/timer state was snapshotted across
+		 * a real power cycle.  Restarting the interactive governor
+		 * (del_timer_sync on a power-cycled per-cpu timer) hangs here.
+		 * The snapshotted governor was already resumed by the image; only
+		 * skip the re-START so we reach userspace.  A later normal mem
+		 * suspend restarts governors because warp_stat is reset to 0 at
+		 * the end of the warp resume unwind.
+		 */
+		pr_info("cpufreq: warp cold restore - skipping governor restart (warp_stat=%d)\n",
+			warp_stat);
+		return;
+	}
+#endif
 
 	for_each_possible_cpu(cpu) {
 		if (!cpu_online(cpu))

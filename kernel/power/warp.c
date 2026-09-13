@@ -19,7 +19,12 @@
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
 #include <linux/warp_param.h>
+#include <linux/workqueue.h>
 #include <asm/uaccess.h>
+
+/* set by warp_rk818_resume() in drivers/mfd/rk818.c during the machine-HAL
+ * cold restore; consulted here only for diagnostics */
+extern int warp_pmic_cold_started;
 
 #ifdef CONFIG_MTD
 #undef DEBUG
@@ -1439,6 +1444,90 @@ void warp_save_cancel(void)
     }
 }
 
+/*
+ * Post-restore liveness probe: after a warp image restore (or aborted save),
+ * periodically printk a tick into the console-ramoops ring while probing
+ * storage read/write/fsync, so a silent post-restore hang can be diagnosed
+ * post-mortem without UART: after the next boot, the pstore console-ramoops
+ * file shows the last completed stage before the hang.
+ */
+#define WARP_LIVE_MAX_TICKS	24
+
+static struct delayed_work warp_live_work;
+static int warp_live_n;
+static struct file *warp_live_filp;
+
+static void warp_live_fn(struct work_struct *w)
+{
+	mm_segment_t oldfs;
+	char buf[64];
+	struct file *filp;
+	loff_t pos;
+	int n, len, ret;
+
+	n = ++warp_live_n;
+	if (n > WARP_LIVE_MAX_TICKS) {
+		pr_info("warp-live: %d ticks, probe stop\n", WARP_LIVE_MAX_TICKS);
+		return;
+	}
+
+	pr_info("warp-live: tick %d read-try\n", n);
+	filp = filp_open("/dev/mmcblk0p5", O_RDONLY, 0);
+	if (IS_ERR(filp)) {
+		pr_info("warp-live: tick %d read-open err %ld\n", n, PTR_ERR(filp));
+	} else {
+		char sect[512];
+		oldfs = get_fs();
+		set_fs(KERNEL_DS);
+		pos = 0;
+		ret = vfs_read(filp, sect, sizeof(sect), &pos);
+		set_fs(oldfs);
+		filp_close(filp, 0);
+		pr_info("warp-live: tick %d read ret=%d head=%08x\n", n, ret,
+			ret == (int)sizeof(sect) ? *(u32 *)sect : 0);
+	}
+
+	if (!warp_live_filp) {
+		oldfs = get_fs();
+		set_fs(KERNEL_DS);
+		warp_live_filp = filp_open("/root/warp-live.log",
+					   O_WRONLY | O_CREAT | O_APPEND, 0600);
+		set_fs(oldfs);
+		if (IS_ERR(warp_live_filp)) {
+			pr_info("warp-live: tick %d open err %ld\n", n, PTR_ERR(warp_live_filp));
+			warp_live_filp = NULL;
+		}
+	}
+	if (warp_live_filp) {
+		pr_info("warp-live: tick %d write-try\n", n);
+		len = snprintf(buf, sizeof(buf), "tick %d\n", n);
+		oldfs = get_fs();
+		set_fs(KERNEL_DS);
+		ret = vfs_write(warp_live_filp, buf, len, &warp_live_filp->f_pos);
+		set_fs(oldfs);
+		if (ret < 0) {
+			pr_info("warp-live: tick %d write err %d\n", n, ret);
+		} else {
+			pr_info("warp-live: tick %d fsync-try\n", n);
+			oldfs = get_fs();
+			set_fs(KERNEL_DS);
+			ret = vfs_fsync(warp_live_filp, 0);
+			set_fs(oldfs);
+			pr_info("warp-live: tick %d fsync ret=%d\n", n, ret);
+		}
+	}
+
+	schedule_delayed_work(&warp_live_work, 5 * HZ);
+}
+
+static void warp_liveness_start(void)
+{
+	INIT_DELAYED_WORK(&warp_live_work, warp_live_fn);
+	warp_live_n = 0;
+	pr_info("warp-live: start\n");
+	schedule_delayed_work(&warp_live_work, HZ);
+}
+
 int hibernate(void)
 {
     int ret;
@@ -1818,6 +1907,8 @@ pm_device_suspend_err:
 #ifndef WARP_SUSPEND_ERR_RECOVER
 pm_device_suspend_err:
 #endif
+    printk(KERN_INFO "W22-A dpm_resume returned cold_started=%d\n",
+           warp_pmic_cold_started);
 
     if (warp_ops->device_resume_late)
         warp_ops->device_resume_late();
@@ -1835,10 +1926,12 @@ warp_device_suspend_early_err:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,19)
     resume_console();
 #endif
+    printk(KERN_INFO "W22-B resume_console returned, calling dpm_complete\n");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
 dpm_prepare_err:
     dpm_complete(STATE_RESTORE);
+    printk(KERN_INFO "W22-C dpm_complete returned\n");
 
 freeze_kernel_threads_err:
 #endif
@@ -1861,7 +1954,12 @@ dpm_prepare_err:
 freeze_processes_err:
     if (warp_ops->progress)
         warp_ops->progress(WARP_PROGRESS_THAW);
+    printk(KERN_INFO "W22-D entering thaw_processes\n");
     thaw_processes();
+    printk(KERN_INFO "W22-E thaw_processes returned\n");
+
+    warp_liveness_start();
+    printk(KERN_INFO "W22-F liveness scheduled\n");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)
@@ -1916,6 +2014,11 @@ canceled:
     if (warp_separate_pass == 2)
         warp_separate_pass = 0;
 
+    /* Cold restore consumed warp_stat to drive STATE_RESTORE / cpufreq skip;
+     * clear it so a later normal mem suspend in this session restarts
+     * cpufreq governors. */
+    warp_stat = 0;
+
     pm_device_down = WARP_STATE_NORMAL;
 
     if (warp_ops->progress)
@@ -1957,6 +2060,9 @@ static struct proc_dir_entry *proc_warp_division;
 static struct proc_dir_entry *proc_warp_oneshot;
 static struct proc_dir_entry *proc_warp_halt;
 static struct proc_dir_entry *proc_warp_silent;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+static struct proc_dir_entry *proc_warp_tmr_fault;
+#endif
 
 static int read_proc_warp(char __user *buffer, size_t count,
                           loff_t *offset, int value)
@@ -2081,6 +2187,37 @@ PROC_RW(separate, warp_separate, "separate", 0, 2, separate_pass_init)
 PROC_RW(oneshot, warp_param.oneshot, "oneshot", 0, 1, dummy)
 PROC_RW(halt, warp_param.halt, "halt", 0, 1, dummy)
 PROC_RW(silent, warp_param.silent, "silent", 0, 3, dummy)
+
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * Self-test hook: writing 1 deliberately corrupts a timer-wheel bucket so the
+ * cold-restore detect/repair path can be verified on demand instead of waiting
+ * for the intermittent real corruption (see warp_tmr_fault_inject in
+ * kernel/timer.c).
+ */
+extern int warp_tmr_fault_inject(void);
+
+static ssize_t write_proc_warp_tmr_fault(struct file *file,
+                                         const char __user *buffer,
+                                         size_t count, loff_t *offset)
+{
+    int err, val;
+
+    if ((err = write_proc_warp(buffer, count, offset, 0, 1, &val,
+                               "tmr_fault")) < 0)
+        return err;
+    if (val) {
+        int r = warp_tmr_fault_inject();
+
+        printk(KERN_EMERG "warp: tmr_fault inject ret=%d\n", r);
+    }
+    return count;
+}
+
+static const struct file_operations proc_warp_tmr_fault_fops = {
+    .write = write_proc_warp_tmr_fault,
+};
+#endif
 
 static int read_proc_warp_division(struct file *file, char __user *buffer,
                                    size_t count, loff_t *offset)
@@ -2218,6 +2355,10 @@ static int __init warp_init(void)
             warp_proc_create("oneshot", 1, &proc_warp_oneshot_fops);
         proc_warp_halt = warp_proc_create("halt", 1, &proc_warp_halt_fops);
         proc_warp_silent = warp_proc_create("silent", 1, &proc_warp_silent_fops);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+        proc_warp_tmr_fault =
+            warp_proc_create("tmr_fault", 1, &proc_warp_tmr_fault_fops);
+#endif
     }
 #endif
 

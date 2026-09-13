@@ -17,6 +17,8 @@
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/pm_runtime.h>
+#include <linux/irqflags.h>
+#include <linux/sched.h>
 
 #include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
@@ -129,6 +131,9 @@ static void mmc_bus_shutdown(struct device *dev)
 	struct mmc_host *host = card->host;
 	int ret = 0;
 
+	pr_emerg("WARP-DIAG: mmc_bus_shutdown enter %s cpu=%d comm=%s j=%lu\n",
+		 mmc_hostname(host), raw_smp_processor_id(), current->comm, jiffies);
+
 	if (dev->driver && drv->shutdown)
 	    drv->shutdown(card);
 
@@ -139,6 +144,8 @@ static void mmc_bus_shutdown(struct device *dev)
             pr_warn("%s: error %d during shutdown\n",mmc_hostname(host), ret);
 	}
 
+	pr_emerg("WARP-DIAG: mmc_bus_shutdown exit %s ret=%d j=%lu\n",
+		 mmc_hostname(host), ret, jiffies);
 }
 
 #ifdef CONFIG_PM_SLEEP
