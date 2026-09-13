@@ -39,9 +39,11 @@
 #include <linux/kallsyms.h>
 #include <linux/irq_work.h>
 #include <linux/sched.h>
+#include <linux/warp_diag.h>
 #include <linux/sched/sysctl.h>
 #include <linux/slab.h>
 #include <linux/compat.h>
+#include <linux/uaccess.h>
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -337,12 +339,116 @@ void set_timer_slack(struct timer_list *timer, int slack_hz)
 }
 EXPORT_SYMBOL_GPL(set_timer_slack);
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * Warp cold-restore diagnostics.  Every wheel insertion/removal is validated
+ * against the registered per-cpu tvec_bases.  A cold restore that leaves a
+ * stale ->base, or a walk of an already-corrupt bucket, feeds a non-timer
+ * (e.g. a vec[] array slot) into __internal_add_timer(); that silently
+ * rewrites base->next_timer with a pointer and links the vec slot into the
+ * wheel, after which __next_timer_interrupt() spins forever and cascade()
+ * trips its BUG_ON.  Name the offending caller with a stack dump.
+ *
+ * WARP-TMRBAD: <tag> add cpu=N base=.. timer=.. fn=.. exp=.. tbase=.. j=.. tj=..
+ * WARP-TMRBAD: del <tag> cpu=N timer=.. fn=.. exp=.. tbase=.. next=.. prev=..
+ */
+extern void warp_ww_note_corruption_live(unsigned long addr);
+
+static int warp_tmr_is_base(struct tvec_base *base)
+{
+	int cpu;
+
+	if (base == &boot_tvec_bases)
+		return 1;
+	for_each_possible_cpu(cpu) {
+		if (base == per_cpu(tvec_bases, cpu))
+			return 1;
+	}
+	return 0;
+}
+
+static int warp_tmr_in_base(void *p)
+{
+	unsigned long a = (unsigned long)p;
+	int cpu;
+
+	if (a >= (unsigned long)&boot_tvec_bases &&
+	    a < (unsigned long)&boot_tvec_bases + sizeof(struct tvec_base))
+		return 1;
+	for_each_possible_cpu(cpu) {
+		struct tvec_base *b = per_cpu(tvec_bases, cpu);
+
+		if (!b)
+			continue;
+		if (a >= (unsigned long)b &&
+		    a < (unsigned long)b + sizeof(struct tvec_base))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Bounded so a single spurious/unexpected event can never flood the console
+ * and stall boot.  No dump_stack() here: this runs in the timer hot path with
+ * base->lock held and IRQs off, so a stack dump per hit would wedge boot.
+ * The caller return address is enough to name the offending code path.
+ */
+static int warp_bad_events;
+
+static void warp_tmr_bad_add(const char *tag, struct tvec_base *base,
+			     struct timer_list *timer, void *ra)
+{
+	if (warp_bad_events++ >= 16)
+		return;
+	printk(KERN_EMERG "WARP-TMRBAD: %s add cpu=%d base=%p timer=%p fn=%p exp=0x%lx tbase=%p j=0x%lx tj=0x%lx ra=%p\n",
+		tag, raw_smp_processor_id(), base, timer, timer->function,
+		timer->expires, timer->base, jiffies,
+		base ? base->timer_jiffies : 0, ra);
+}
+
+static void warp_tmr_bad_del(const char *tag, struct timer_list *timer,
+			     void *ra)
+{
+	if (warp_bad_events++ >= 16)
+		return;
+	printk(KERN_EMERG "WARP-TMRBAD: del %s cpu=%d timer=%p fn=%p exp=0x%lx tbase=%p next=%p prev=%p ra=%p\n",
+		tag, raw_smp_processor_id(), timer, timer->function,
+		timer->expires, timer->base, timer->entry.next,
+		timer->entry.prev, ra);
+}
+
+#define WARP_ADD_CHECK(base, timer) do { \
+	struct tvec_base *_b = (base); \
+	struct timer_list *_t = (timer); \
+	if (unlikely(!warp_tmr_is_base(_b))) { \
+		warp_tmr_bad_add("base", _b, _t, __builtin_return_address(0)); \
+		warp_ww_note_corruption_live((unsigned long)&_t->base); \
+	} else if (unlikely(warp_tmr_in_base(_t) || \
+			  tbase_get_base(_t->base) != _b)) { \
+		warp_tmr_bad_add("timer", _b, _t, __builtin_return_address(0)); \
+		if (!warp_tmr_in_base(_t)) \
+			warp_ww_note_corruption_live((unsigned long)&_t->base); \
+	} \
+} while (0)
+
+#define WARP_DEL_CHECK(timer, tag) do { \
+	struct timer_list *_t = (timer); \
+	if (unlikely(warp_tmr_in_base(_t))) \
+		warp_tmr_bad_del(tag, _t, __builtin_return_address(0)); \
+} while (0)
+#else
+#define WARP_ADD_CHECK(base, timer) do { } while (0)
+#define WARP_DEL_CHECK(timer, tag) do { } while (0)
+#endif
+
 static void
 __internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 {
 	unsigned long expires = timer->expires;
 	unsigned long idx = expires - base->timer_jiffies;
 	struct list_head *vec;
+
+	WARP_ADD_CHECK(base, timer);
 
 	if (idx < TVR_SIZE) {
 		int i = expires & TVR_MASK;
@@ -659,6 +765,7 @@ static inline void detach_timer(struct timer_list *timer, bool clear_pending)
 
 	debug_deactivate(timer);
 
+	WARP_DEL_CHECK(timer, "detach");
 	__list_del(entry->prev, entry->next);
 	if (clear_pending)
 		entry->next = NULL;
@@ -688,6 +795,75 @@ static int detach_if_pending(struct timer_list *timer, struct tvec_base *base,
 	return 1;
 }
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * Warp cold-restore diagnostics.  Remember, per cpu, where the local cpu
+ * last took a tvec_base lock and which callback it last entered, so the
+ * watchdog on a peer cpu can name the code that a dead cpu died holding.
+ */
+unsigned long warp_tmr_site[NR_CPUS];
+unsigned long warp_tmr_site_base[NR_CPUS];
+unsigned long warp_tmr_fn[NR_CPUS];
+unsigned long warp_tmr_fn_ts[NR_CPUS];
+
+#define WARP_LOCK_MARK(b) do { \
+	int _wc = raw_smp_processor_id(); \
+	if (_wc < NR_CPUS) { \
+		warp_tmr_site[_wc] = (unsigned long)_THIS_IP_; \
+		warp_tmr_site_base[_wc] = (unsigned long)(b); \
+	} \
+} while (0)
+
+#define WARP_FN_MARK(f) do { \
+	int _wc = raw_smp_processor_id(); \
+	if (_wc < NR_CPUS) { \
+		warp_tmr_fn[_wc] = (unsigned long)(f); \
+		warp_tmr_fn_ts[_wc] = jiffies; \
+	} \
+} while (0)
+
+/*
+ * Per-cpu phase marker (see include/linux/warp_diag.h).  local_clock() rather
+ * than jiffies: the cpu that owns the global tick may itself be the one that is
+ * stuck, in which case jiffies freezes and a stale marker would look fresh.
+ */
+unsigned int warp_phase[NR_CPUS];
+u64 warp_phase_ts[NR_CPUS];
+
+void warp_phase_set(unsigned int ph)
+{
+	int c = raw_smp_processor_id();
+
+	if (c < NR_CPUS) {
+		warp_phase[c] = ph;
+		warp_phase_ts[c] = local_clock();
+	}
+}
+EXPORT_SYMBOL(warp_phase_set);
+
+static const char * const warp_phase_names[] = {
+	[WARP_PH_NONE]		= "none",
+	[WARP_PH_RUN_TIMERS]	= "run_timers",
+	[WARP_PH_CASCADE]	= "cascade",
+	[WARP_PH_NEXT_TIMER]	= "next_timer",
+	[WARP_PH_GET_NEXT]	= "get_next_timer",
+	[WARP_PH_MIGRATE]	= "migrate",
+	[WARP_PH_CONSOLE_LOCK]	= "console_lock",
+	[WARP_PH_FB_BLANK]	= "fb_blank",
+};
+
+const char *warp_phase_name(unsigned int ph)
+{
+	if (ph >= ARRAY_SIZE(warp_phase_names) || !warp_phase_names[ph])
+		return "?";
+	return warp_phase_names[ph];
+}
+EXPORT_SYMBOL(warp_phase_name);
+#else
+#define WARP_LOCK_MARK(b) do { } while (0)
+#define WARP_FN_MARK(f) do { } while (0)
+#endif
+
 /*
  * We are using hashed locking: holding per_cpu(tvec_bases).lock
  * means that all timers which are tied to this base via timer->base are
@@ -710,6 +886,7 @@ static struct tvec_base *lock_timer_base(struct timer_list *timer,
 		struct tvec_base *prelock_base = timer->base;
 		base = tbase_get_base(prelock_base);
 		if (likely(base != NULL)) {
+			WARP_LOCK_MARK(base);
 			spin_lock_irqsave(&base->lock, *flags);
 			if (likely(prelock_base == timer->base))
 				return base;
@@ -760,6 +937,7 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 			timer_set_base(timer, NULL);
 			spin_unlock(&base->lock);
 			base = new_base;
+			WARP_LOCK_MARK(base);
 			spin_lock(&base->lock);
 			timer_set_base(timer, base);
 		}
@@ -928,6 +1106,7 @@ void add_timer_on(struct timer_list *timer, int cpu)
 
 	timer_stats_timer_set_start_info(timer);
 	BUG_ON(timer_pending(timer) || !timer->function);
+	WARP_LOCK_MARK(base);
 	spin_lock_irqsave(&base->lock, flags);
 	timer_set_base(timer, base);
 	debug_activate(timer, timer->expires);
@@ -1068,21 +1247,264 @@ int del_timer_sync(struct timer_list *timer)
 EXPORT_SYMBOL(del_timer_sync);
 #endif
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * A freed/recycled wheel entry is filled with POISON_INUSE (0x5a5a5a5a), so
+ * its ->next points at 0x5a5a5a5a and a blind deref faults *inside this
+ * diagnostic* -- turning a corruption report into a fresh oops that hides the
+ * real bug (#51: fault @0x5a5a5a66 at warp_dump_tv_slot+0x78).  Reject
+ * non-kernel/misaligned pointers up front, and read node fields through
+ * probe_kernel_read() so even a wild-but-plausible address cannot fault here.
+ */
+static int warp_tmr_ptr_ok(const void *p)
+{
+	unsigned long v = (unsigned long)p;
+
+	if (v < PAGE_OFFSET || (v & 3))
+		return 0;
+	return 1;
+}
+
+/*
+ * Bounded walk of one timer-wheel bucket.  A bucket that has gone cyclic (a
+ * timer added while it was already linked) makes the unbounded
+ * list_for_each_entry() in __next_timer_interrupt()/cascade() spin forever
+ * with base->lock held and IRQs off -- exactly the hard lockup seen after a
+ * cold restore.
+ */
+static void warp_dump_tv_slot(struct tvec_base *base, int cpu,
+			      struct list_head *head, const char *tag, int slot)
+{
+	struct list_head *pos;
+	struct timer_list t;
+	int cap = base->active_timers + 1;
+	int n = 0, stopped = 0;
+
+	if (cap > 24)
+		cap = 24;
+	if (cap < 4)
+		cap = 4;
+
+	printk(KERN_EMERG "WARP-TMR: cpu%d %s[%d] head=%p next=%p prev=%p base=%p\n",
+		cpu, tag, slot, head, head->next, head->prev, base);
+	for (pos = head->next; pos != head && n < cap; ) {
+		if (!warp_tmr_ptr_ok(pos)) {
+			printk(KERN_EMERG "WARP-TMR: cpu%d %s[%d] n=%d node=%p POISON/INVALID -> stop\n",
+				cpu, tag, slot, n, pos);
+			stopped = 1;
+			break;
+		}
+		/* entry is offset 0 in struct timer_list, so pos == &t.entry */
+		if (probe_kernel_read(&t, pos, sizeof(t))) {
+			printk(KERN_EMERG "WARP-TMR: cpu%d %s[%d] n=%d node=%p unreadable -> stop\n",
+				cpu, tag, slot, n, pos);
+			stopped = 1;
+			break;
+		}
+		printk(KERN_EMERG "WARP-TMR: cpu%d  n=%d node=%p next=%p prev=%p fn=%p exp=0x%lx data=0x%lx tbase=%p\n",
+			cpu, n, pos, t.entry.next, t.entry.prev, t.function,
+			t.expires, t.data, t.base);
+		n++;
+		pos = t.entry.next;
+	}
+	if (!stopped && pos != head)
+		printk(KERN_EMERG "WARP-TMR: cpu%d %s[%d] more nodes than active_timers(%lu) -> list is CYCLIC\n",
+			cpu, tag, slot, base->active_timers);
+}
+
+void warp_timer_loop_report(const char *where, struct tvec_base *base,
+			    const char *tag, struct list_head *head, int slot)
+{
+	static unsigned long last;
+
+	/*
+	 * NB: jiffies starts negative (INITIAL_JIFFIES = -300*HZ), so a 0
+	 * sentinel would make time_before() true forever and silence this for
+	 * the first ~300s of uptime.  Test the sentinel explicitly.
+	 */
+	if (last && time_before(jiffies, last + HZ))
+		return;
+	last = jiffies;
+
+	printk(KERN_EMERG "WARP-LOOP: %s spins cpu=%d comm=%s/%d base=%p jiffies=0x%lx tj=0x%lx active=%lu running=%p\n",
+		where, raw_smp_processor_id(), current->comm, current->pid, base,
+		jiffies, base->timer_jiffies, base->active_timers,
+		base->running_timer);
+	/* Last code that took a base lock / last timer fn entered, per cpu: hints
+	 * at which writer was active on this cpu around the corruption. */
+	printk(KERN_EMERG "WARP-LOOP: cpu%d site=0x%08lx site_base=%p last_fn=%p fn_ts=0x%lx\n",
+		raw_smp_processor_id(), warp_tmr_site[raw_smp_processor_id()],
+		(void *)warp_tmr_site_base[raw_smp_processor_id()],
+		(void *)warp_tmr_fn[raw_smp_processor_id()],
+		warp_tmr_fn_ts[raw_smp_processor_id()]);
+	if (head)
+		warp_dump_tv_slot(base, raw_smp_processor_id(), head, tag, slot);
+	dump_stack();
+}
+
+/*
+ * A bucket can never legally hold more than active_timers real timers; walking
+ * more than that proves a cycle.  Clamped so a corrupt (huge) active_timers
+ * still bounds the walk.
+ */
+static int warp_tmr_cap(struct tvec_base *base)
+{
+	int cap = base->active_timers + 1;
+
+	if (cap < 8)
+		cap = 8;
+	if (cap > 4096)
+		cap = 4096;
+	return cap;
+}
+
+/*
+ * Bounded, read-only integrity check of one bucket.  Non-zero if the list is
+ * cyclic, or if any node is not a real timer of a registered base (e.g. a
+ * vec[] slot that got spliced in as if it were a timer_list).
+ */
+static int warp_tmr_slot_bad(struct list_head *head, int cap)
+{
+	struct list_head *pos;
+	int n = 0;
+
+	for (pos = head->next; pos != head; pos = pos->next) {
+		struct timer_list *t;
+
+		if (++n > cap)			/* cyclic */
+			return 1;
+		if (unlikely(warp_tmr_in_base(pos)))	/* a vec[] slot */
+			return 1;
+		t = list_entry(pos, struct timer_list, entry);
+		if (unlikely(!warp_tmr_is_base(tbase_get_base(t->base))))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Repair one bucket in place.  Bounded walk (a cyclic list otherwise spins
+ * forever with base->lock held); valid timers still linked before the trouble
+ * are salvaged back into the wheel, a bad node (a vec[] slot) or a wrong
+ * ->base stops the walk and the rest of the chain is dropped rather than
+ * trusted.  The head is always left normalized.  Caller checks + reports
+ * first (read-only) so the dump shows the corrupt state.  Returns bad count.
+ */
+static int warp_tmr_repair(struct tvec_base *base, struct list_head *head)
+{
+	struct list_head *pos, *next;
+	int guard = 0, bad = 0, cap = warp_tmr_cap(base);
+
+	for (pos = head->next; pos != head; pos = next) {
+		struct timer_list *timer;
+
+		next = pos->next;		/* save before mutating */
+		if (++guard > cap || unlikely(warp_tmr_in_base(pos))) {
+			bad = 1;
+			break;
+		}
+		timer = list_entry(pos, struct timer_list, entry);
+		if (unlikely(tbase_get_base(timer->base) != base)) {
+			bad = 1;
+			break;
+		}
+		list_del_init(pos);
+		__internal_add_timer(base, timer);
+		/*
+		 * __internal_add_timer() is the raw variant and leaves next_timer
+		 * alone; a salvaged non-deferrable timer earlier than the recorded
+		 * next event must pull next_timer in, else the nohz tick gets
+		 * programmed past it.  active_timers is untouched - the raw
+		 * unlink/add pair nets to zero.
+		 */
+		if (!tbase_get_deferrable(timer->base) &&
+		    time_before(timer->expires, base->next_timer))
+			base->next_timer = timer->expires;
+	}
+	if (unlikely(bad))
+		INIT_LIST_HEAD(head);		/* drop the un-salvaged tail */
+	return bad;
+}
+
+/*
+ * Periodic integrity sweep of the whole wheel.  The writer that splices a
+ * bogus node into a bucket bypasses __internal_add_timer (no WARP-TMRBAD), so
+ * the only way to bound when it acts is to re-check every slot on a timer.
+ * Fires at most every 2s; reports and repairs the first bad bucket found.
+ */
+static void warp_tmr_sweep(struct tvec_base *base, const char *where)
+{
+	static unsigned long next_sweep;
+	struct tvec *arr[4] = { &base->tv2, &base->tv3, &base->tv4, &base->tv5 };
+	int level, i, cap = warp_tmr_cap(base);
+
+	/*
+	 * NB: jiffies starts negative (INITIAL_JIFFIES = -300*HZ), so a 0
+	 * sentinel would make time_before() true and skip every sweep until
+	 * jiffies crosses 0 (~300s in).  Test the sentinel explicitly.
+	 */
+	if (next_sweep && time_before(jiffies, next_sweep))
+		return;
+	next_sweep = jiffies + 2 * HZ;
+
+	for (i = 0; i < TVR_SIZE; i++) {
+		struct list_head *h = base->tv1.vec + i;
+
+		if (warp_tmr_slot_bad(h, cap)) {
+			warp_timer_loop_report(where, base, "tv1", h, i);
+			warp_tmr_repair(base, h);
+			return;
+		}
+	}
+	for (level = 0; level < 4; level++) {
+		for (i = 0; i < TVN_SIZE; i++) {
+			struct list_head *h = arr[level]->vec + i;
+
+			if (warp_tmr_slot_bad(h, cap)) {
+				warp_timer_loop_report(where, base, "tvn", h, i);
+				warp_tmr_repair(base, h);
+				return;
+			}
+		}
+	}
+}
+#endif
+
 static int cascade(struct tvec_base *base, struct tvec *tv, int index)
 {
 	/* cascade all the timers from tv up one level */
-	struct timer_list *timer, *tmp;
 	struct list_head tv_list;
 
+	WARP_PHASE(WARP_PH_CASCADE);
 	list_replace_init(tv->vec + index, &tv_list);
 
 	/*
-	 * We are removing _all_ timers from the list, so we
-	 * don't have to detach them individually.
+	 * A bucket that has gone cyclic would otherwise spin forever here with
+	 * base->lock held and IRQs off (a silent hard lockup after a cold
+	 * restore).  Report the corrupt state, then salvage what we can and
+	 * drop the rest instead of BUG_ON'ing.
 	 */
-	list_for_each_entry_safe(timer, tmp, &tv_list, entry) {
-		BUG_ON(tbase_get_base(timer->base) != base);
-		/* No accounting, while moving them */
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	if (unlikely(warp_tmr_slot_bad(&tv_list, warp_tmr_cap(base)))) {
+		warp_timer_loop_report("cascade", base, "casc",
+				       tv->vec + index, index);
+		warp_tmr_repair(base, &tv_list);
+		return index;		/* repair salvaged what it could */
+	}
+#endif
+	/*
+	 * Normal path: move every cascaded timer back up into the wheel, exactly
+	 * as upstream does.  Without this the timers are simply dropped, so any
+	 * timer scheduled more than TVR_SIZE jiffies out (tv2..tv5) never fires
+	 * -- and an abandoned timer's entry.prev/entry.next keep pointing at the
+	 * dead tv_list on this stack frame, so a later del_timer()/mod_timer()
+	 * writes through __list_del() into a stale stack slot.
+	 */
+	while (!list_empty(&tv_list)) {
+		struct timer_list *timer;
+
+		timer = list_first_entry(&tv_list, struct timer_list, entry);
+		list_del(&timer->entry);
 		__internal_add_timer(base, timer);
 	}
 
@@ -1134,6 +1556,42 @@ static void call_timer_fn(struct timer_list *timer, void (*fn)(unsigned long),
 
 #define INDEX(N) ((base->timer_jiffies >> (TVR_BITS + (N) * TVN_BITS)) & TVN_MASK)
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * WARP-TMRFN: __run_timers guards against a cyclic bucket but never checks
+ * that timer->function is real code before call_timer_fn() calls it.  The
+ * systemic corruption overwrites 4-byte heap pointers into freed slab memory,
+ * and a timer whose ->function lands on one of those jumps straight into the
+ * heap (seen as "PC is at 0xd5f0f310", Comm: swapper/0).  Validate first,
+ * report what the timer actually was, then drop the entry instead of calling
+ * it -- non-fatal, so the soak keeps running.
+ */
+static void warp_timer_badfn_report(struct tvec_base *base,
+				    struct timer_list *timer,
+				    void (*fn)(unsigned long),
+				    int index, struct list_head *head)
+{
+	pr_emerg("WARP-TMRFN: cpu=%d base=%p idx=%d timer=%p fn=%p data=0x%lx exp=0x%lx tbase=%p\n",
+		 smp_processor_id(), base, index, timer, fn,
+		 timer->data, timer->expires, timer->base);
+	if (virt_addr_valid(timer)) {
+		pr_emerg("WARP-TMRFN: entry next=%p prev=%p head=%p head.next=%p head.prev=%p\n",
+			 timer->entry.next, timer->entry.prev, head,
+			 head->next, head->prev);
+		print_hex_dump(KERN_EMERG, "WARP-TMRFN timer: ",
+			       DUMP_PREFIX_OFFSET, 16, 4, timer,
+			       sizeof(*timer), 0);
+	}
+	if (virt_addr_valid((void *)timer->data)) {
+		pr_emerg("WARP-TMRFN: object at timer->data:\n");
+		print_hex_dump(KERN_EMERG, "WARP-TMRFN data: ",
+			       DUMP_PREFIX_OFFSET, 16, 4,
+			       (void *)timer->data, 64, 0);
+	}
+	dump_stack();
+}
+#endif
+
 /**
  * __run_timers - run all expired timers (if any) on this CPU.
  * @base: the timer vector to be processed.
@@ -1144,12 +1602,37 @@ static void call_timer_fn(struct timer_list *timer, void (*fn)(unsigned long),
 static inline void __run_timers(struct tvec_base *base)
 {
 	struct timer_list *timer;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	int guard;
+	unsigned long _outer = 0;
+	unsigned long _cap;
+#endif
 
+	WARP_LOCK_MARK(base);
 	spin_lock_irq(&base->lock);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	warp_tmr_sweep(base, "run_timers");
+	/*
+	 * The outer loop advances timer_jiffies by one per pass, so it cannot
+	 * spin by itself; it is only unbounded if that counter stops advancing.
+	 * Bound it to the lateness it is legitimately catching up plus slack, so
+	 * a real nohz catch-up is never truncated but corrupt state is.
+	 */
+	_cap = (unsigned long)(jiffies - base->timer_jiffies) + 2 * TVR_SIZE + 64;
+#endif
 	while (time_after_eq(jiffies, base->timer_jiffies)) {
 		struct list_head work_list;
 		struct list_head *head = &work_list;
 		int index = base->timer_jiffies & TVR_MASK;
+
+		WARP_PHASE(WARP_PH_RUN_TIMERS);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		if (unlikely(++_outer > _cap)) {
+			warp_timer_loop_report("run_timers.outer", base,
+					       "outer", NULL, 0);
+			break;
+		}
+#endif
 
 		/*
 		 * Cascade timers:
@@ -1161,19 +1644,45 @@ static inline void __run_timers(struct tvec_base *base)
 			cascade(base, &base->tv5, INDEX(3));
 		++base->timer_jiffies;
 		list_replace_init(base->tv1.vec + index, &work_list);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		guard = 0;
+#endif
 		while (!list_empty(head)) {
 			void (*fn)(unsigned long);
 			unsigned long data;
 			bool irqsafe;
 
 			timer = list_first_entry(head, struct timer_list,entry);
+			/*
+			 * The tv1 bucket can also be cyclic; list_first_entry()
+			 * would then hand back a bogus "timer" and we would call
+			 * its garbage ->function().  Validate before trusting it,
+			 * and drop the bucket rather than lock up.
+			 */
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+			if (unlikely(++guard > warp_tmr_cap(base) ||
+				     warp_tmr_in_base(timer))) {
+				warp_timer_loop_report("run_timers.tv1", base,
+						       "tv1", head, index);
+				warp_tmr_repair(base, head);
+				break;
+			}
+#endif
 			fn = timer->function;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+			if (unlikely(!kernel_text_address((unsigned long)fn))) {
+				warp_timer_badfn_report(base, timer, fn, index, head);
+				detach_expired_timer(timer, base);
+				continue;
+			}
+#endif
 			data = timer->data;
 			irqsafe = tbase_get_irqsafe(timer->base);
 
 			timer_stats_account_timer(timer);
 
 			base->running_timer = timer;
+			WARP_FN_MARK(fn);
 			detach_expired_timer(timer, base);
 
 			if (irqsafe) {
@@ -1204,11 +1713,26 @@ static unsigned long __next_timer_interrupt(struct tvec_base *base)
 	int index, slot, array, found = 0;
 	struct timer_list *nte;
 	struct tvec *varray[4];
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	int guard = 0;
+#endif
+
+	WARP_PHASE(WARP_PH_NEXT_TIMER);
 
 	/* Look for timer events in tv1. */
 	index = slot = timer_jiffies & TVR_MASK;
 	do {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		guard = 0;
+#endif
 		list_for_each_entry(nte, base->tv1.vec + slot, entry) {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+			if (++guard > warp_tmr_cap(base)) {
+				warp_timer_loop_report("next_timer.tv1", base,
+					"tv1", base->tv1.vec + slot, slot);
+				break;
+			}
+#endif
 			if (tbase_get_deferrable(nte->base))
 				continue;
 
@@ -1239,7 +1763,17 @@ cascade:
 
 		index = slot = timer_jiffies & TVN_MASK;
 		do {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+			guard = 0;
+#endif
 			list_for_each_entry(nte, varp->vec + slot, entry) {
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+				if (++guard > warp_tmr_cap(base)) {
+					warp_timer_loop_report("next_timer.tvn", base,
+						"tvn", varp->vec + slot, slot);
+					break;
+				}
+#endif
 				if (tbase_get_deferrable(nte->base))
 					continue;
 
@@ -1327,6 +1861,8 @@ unsigned long get_next_timer_interrupt(unsigned long now)
 	if (cpu_is_offline(smp_processor_id()))
 		return expires;
 
+	WARP_PHASE(WARP_PH_GET_NEXT);
+	WARP_LOCK_MARK(base);
 	spin_lock(&base->lock);
 	if (base->active_timers) {
 		if (time_before_eq(base->next_timer, base->timer_jiffies))
@@ -1547,6 +2083,13 @@ static int __cpuinit init_timers_cpu(int cpu)
 		base = per_cpu(tvec_bases, cpu);
 	}
 
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	{
+		extern void warp_ww_note_timer_base(int cpu, unsigned long lock_addr);
+
+		warp_ww_note_timer_base(cpu, (unsigned long)&base->lock);
+	}
+#endif
 
 	for (j = 0; j < TVN_SIZE; j++) {
 		INIT_LIST_HEAD(base->tv5.vec + j);
@@ -1567,9 +2110,28 @@ static int __cpuinit init_timers_cpu(int cpu)
 static void migrate_timer_list(struct tvec_base *new_base, struct list_head *head)
 {
 	struct timer_list *timer;
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+	int guard = 0;
+#endif
 
+	WARP_PHASE(WARP_PH_MIGRATE);
 	while (!list_empty(head)) {
 		timer = list_first_entry(head, struct timer_list, entry);
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+		/*
+		 * A cyclic bucket (head unreachable from the ring) never empties:
+		 * detach_timer() keeps re-unlinking the same first node forever.
+		 * Bound the walk and drop a bucket we can no longer trust instead
+		 * of spinning here with two base locks held and IRQs off.
+		 */
+		if (unlikely(++guard > warp_tmr_cap(new_base) ||
+			     warp_tmr_in_base(timer))) {
+			warp_timer_loop_report("migrate", new_base, "mig",
+					       head, 0);
+			INIT_LIST_HEAD(head);
+			break;
+		}
+#endif
 		/* We ignore the accounting on the dying cpu */
 		detach_timer(timer, false);
 		timer_set_base(timer, new_base);
@@ -1706,3 +2268,92 @@ void usleep_range(unsigned long min, unsigned long max)
 	do_usleep_range(min, max);
 }
 EXPORT_SYMBOL(usleep_range);
+
+#if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
+/*
+ * Warp cold-restore diagnostics.  A cpu that hard-locks inside the timer
+ * softirq holds its tvec_base->lock with IRQs off, which then wedges every
+ * other cpu that calls del_timer_sync()/mod_timer() on that base.  Called
+ * from the watchdog on a peer cpu, so the reads are racy - that is fine on
+ * the lockup path.
+ */
+void warp_dump_cpu_timers(unsigned int cpu)
+{
+	struct tvec_base *base;
+	struct timer_list *rt;
+	u32 lk;
+
+	if (cpu >= nr_cpu_ids)
+		return;
+
+	base = per_cpu(tvec_bases, cpu);
+	if (!base) {
+		printk(KERN_EMERG "WARP-TMR: cpu%u base=NULL\n", cpu);
+		return;
+	}
+
+	memcpy(&lk, &base->lock, sizeof(lk));
+	rt = base->running_timer;
+	printk(KERN_EMERG "WARP-TMR: cpu%u base=%p lock=0x%08x running_timer=%p tmr_jiffies=0x%lx next_timer=0x%lx active=%lu jiffies=0x%lx\n",
+		cpu, base, lk, rt, base->timer_jiffies, base->next_timer,
+		base->active_timers, jiffies);
+	printk(KERN_EMERG "WARP-TMR: cpu%u site=0x%08lx site_base=%p last_fn=%p fn_ts=0x%lx\n",
+		cpu, warp_tmr_site[cpu], (void *)warp_tmr_site_base[cpu],
+		(void *)warp_tmr_fn[cpu], warp_tmr_fn_ts[cpu]);
+	if (rt && warp_tmr_ptr_ok(rt)) {
+		struct timer_list rc;
+
+		if (!probe_kernel_read(&rc, rt, sizeof(rc)))
+			printk(KERN_EMERG "WARP-TMR: cpu%u running fn=%p expires=0x%lx data=0x%lx\n",
+				cpu, rc.function, rc.expires, rc.data);
+		else
+			printk(KERN_EMERG "WARP-TMR: cpu%u running=%p unreadable\n", cpu, rt);
+	}
+
+	/* Non-empty tv1 buckets: names pending timers, exposes a cyclic list. */
+	{
+		int i, shown = 0;
+
+		for (i = 0; i < TVR_SIZE && shown < 20; i++) {
+			struct list_head *h = base->tv1.vec + i;
+
+			if (h->next == h)
+				continue;
+			warp_dump_tv_slot(base, cpu, h, "tv1", i);
+			shown++;
+		}
+	}
+}
+EXPORT_SYMBOL(warp_dump_cpu_timers);
+
+/*
+ * Deterministic self-test.  Splice a vec[] slot into tv3.vec[1] as if it were
+ * a timer_list -- reproducing the cold-restore corruption on demand -- so the
+ * repair path can be verified without waiting for the intermittent real bug.
+ * The next 2s sweep (or the next cascade of that bucket) must detect it,
+ * repair it and keep the box alive.  Triggered from /proc/warp/tmr_fault.
+ *
+ * Note: this overwrites the neighbouring slot's head links; the sweep heals
+ * that on a following pass too, so expect up to two WARP-LOOP reports.
+ */
+int warp_tmr_fault_inject(void)
+{
+	struct tvec_base *base = &boot_tvec_bases;
+	struct list_head *head = base->tv3.vec + 1;
+	struct list_head *victim = base->tv3.vec + 2;
+	unsigned long flags;
+
+	spin_lock_irqsave(&base->lock, flags);
+	victim->next = head->next;
+	victim->prev = head;
+	head->next->prev = victim;
+	head->next = victim;
+	spin_unlock_irqrestore(&base->lock, flags);
+
+	printk(KERN_EMERG "WARP-TMRFAULT: injected vec-slot node into tv3.vec[1] head=%p victim=%p j=0x%lx\n",
+		head, victim, jiffies);
+	return 1;
+}
+EXPORT_SYMBOL(warp_tmr_fault_inject);
+#endif
+

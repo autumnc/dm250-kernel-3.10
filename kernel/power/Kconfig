@@ -356,3 +356,15 @@ config PM_WARP_DEBUG
 	bool "Lineo Warp!! debug support"
 	depends on PM_WARP
 
+config WARP_DIAG
+	bool "Warp diagnostic instrumentation"
+	default y
+	depends on PM_WARP
+	---help---
+	  Compiles in the extra corruption/lockup guards added for the DM250
+	  bring-up (WARP-POLL wait-queue audit, WARP-TMR timer-wheel checks,
+	  WARP-BIO / WARP-SKB / WARP-SLUB object checks, WARP-RI integrity
+	  monitor).  Turn this off to build a Warp kernel with the diagnostics
+	  removed, e.g. to test whether the diagnostics themselves are the
+	  cause of a corruption.
+
