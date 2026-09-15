@@ -37,6 +37,7 @@
 #include <linux/skbuff.h>
 #include <linux/rockchip/cpu.h>
 #include <linux/fb.h>
+#include <linux/warp_param.h>
 #ifdef CONFIG_OF
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -1059,11 +1060,23 @@ MODULE_DEVICE_TABLE(of, wlan_platdata_of_match);
 #endif //CONFIG_OF
 
 #ifdef CONFIG_PM_WARP
+/* Re-drive the wifi power/reset GPIOs after a warp.  This is only correct for
+ * the cold warp (halt=1), where the board really powered off and the chip lost
+ * both its power and its firmware.  A warm warp (halt=0) resumes in place: the
+ * regulator stayed on and the AP62xx kept its firmware, so driving WL_REG_ON
+ * low and back high just resets it to a blank state.  The card then stops
+ * answering on SDIO (every CMD52 times out with -110), bcmdhd's dpc fails and
+ * the interface is eventually torn down and powered off.  Leave it alone. */
 static int rfkill_wlan_pm_resume(struct device *dev)
 {
 	struct rfkill_wlan_data *mrfkill = g_rfkill;
 	struct rksdmmc_gpio *poweron = &mrfkill->pdata->power_n;
 	struct rksdmmc_gpio *reset = &mrfkill->pdata->reset_n;
+
+	if (pm_device_down && !warp_param.halt) {
+		pr_info("wlan_rfkill: warm warp -> wifi chip power left untouched\n");
+		return 0;
+	}
 
 	if (pm_device_down) {
 		if (gpio_is_valid(mrfkill->pdata->power_n.io)) {

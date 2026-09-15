@@ -31,6 +31,7 @@
 #include <linux/regulator/machine.h>
 #include <linux/regmap.h>
 #include <linux/syscore_ops.h>
+#include <linux/warp_param.h>
 
 
 #if 0
@@ -1300,10 +1301,18 @@ void warp_rk818_resume (void)
 #endif	/* CONFIG_PM_WARP */
 
 static int rk818_suspend(struct i2c_client *i2c, pm_message_t mesg)
-{		
+{
 #ifdef CONFIG_PM_WARP
 	if (pm_device_down) {
-		regulator_suspend_prepare(PM_SUSPEND_MEM);
+		/* A warm warp resumes in place without ever removing the
+		 * board's power, so every rail must stay in its active state.
+		 * Putting them into their PM_SUSPEND_MEM state here is what
+		 * drops (or drops the voltage on) the wifi rail across the
+		 * warp; skip it and the SDIO chip rides through untouched. */
+		if (warp_param.halt)
+			regulator_suspend_prepare(PM_SUSPEND_MEM);
+		else
+			printk("warp: warm warp -> keep regulators in active state\n");
 	}
 #endif
 	rk818_device_suspend();
@@ -1324,7 +1333,15 @@ static int rk818_resume(struct i2c_client *i2c)
 		int i;
 		struct regulator_dev *rk818_rdev;
 
-		if (!warp_pmic_cold_started) {
+		if (!warp_param.halt) {
+			/* Warm warp: the SoC and PMIC were never power-cycled, so
+			 * the PMIC registers are still valid and no rail was put
+			 * into its suspend state.  Re-running pre_init (it
+			 * rewrites DCDC_EN etc.) on live rails is pointless and
+			 * has been seen to hang the i2c bus, so leave the PMIC
+			 * alone and skip the matching regulator_suspend_finish. */
+			printk("warp: warm warp -> PMIC untouched, skip pre_init\n");
+		} else if (!warp_pmic_cold_started) {
 			/* HAL skipped cold config (PMIC stayed powered). This dpm
 			 * rk818_resume is the only chance to bring rails back. */
 			printk("warp: rk818_resume pm_device_down, cold_started=0 -> run pre_init\n");
@@ -1339,14 +1356,15 @@ static int rk818_resume(struct i2c_client *i2c)
 			} else {
 				printk("warp: dpm rk818_pre_init OK ret=%d\n",ret);
 			}
+			regulator_suspend_finish();
 		} else {
 			/* warp_rk818_resume (machine HAL) already did pre_init +
 			 * full pm_regs restore right after CRU/GRF restore. Re-running
 			 * pre_init here re-writes DCDC_EN (0x23) on a rail that is
 			 * already up -> observed -110 / bus hang. Skip it. */
 			printk("warp: rk818_resume pm_device_down, cold_started=1 -> skip redundant pre_init\n");
+			regulator_suspend_finish();
 		}
-		regulator_suspend_finish();
 }
 #endif
 	return 0;

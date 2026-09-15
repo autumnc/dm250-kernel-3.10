@@ -32,6 +32,16 @@
 extern char _stext[], _etext[];
 extern char __start_rodata[], __end_rodata[];
 
+/*
+ * arch/arm/mm/proc-v7.S keeps a 4*11-byte scratch stack inside .text that
+ * __v7_setup spills its registers to on every CPU bring-up (boot, CPU hotplug,
+ * and the warp's enable_nonboot_cpus()).  It is written at runtime, so a
+ * word-for-word comparison will legitimately see it change; it is not part of
+ * the read-only region this monitor is meant to police.  Report it, don't panic.
+ */
+extern char __v7_setup_stack[];
+#define V7_SETUP_STACK_LEN (4 * 11)
+
 static char *ri_mirror;			/* snapshot of [_stext, _etext) */
 static int ri_total;			/* words reported this cycle */
 
@@ -104,6 +114,22 @@ static int ri_check(const char *name, unsigned long start, unsigned long end,
 			continue;
 		if (flag_text && ri_jump_label_site((unsigned long)&mem[i], cur) > 0)
 			continue;
+		if ((unsigned long)&mem[i] >= (unsigned long)__v7_setup_stack &&
+		    (unsigned long)&mem[i] <
+			(unsigned long)__v7_setup_stack + V7_SETUP_STACK_LEN) {
+			static u32 v7s_pold, v7s_pnew;
+			static int v7s_have;
+
+			if (!v7s_have || v7s_pold != old || v7s_pnew != cur) {
+				pr_info("WARP-RI: __v7_setup_stack+%lu %08x -> %08x (spill scratch, not ro)\n",
+					(unsigned long)&mem[i] -
+						(unsigned long)__v7_setup_stack, old, cur);
+				v7s_pold = old;
+				v7s_pnew = cur;
+				v7s_have = 1;
+			}
+			continue;
+		}
 		ri_report(name, (unsigned long)&mem[i], old, cur);
 		nbad++;
 	}
@@ -147,6 +173,8 @@ static int __init warp_ri_init(void)
 
 	pr_info("WARP-RI: monitoring [%p..%p) %lu bytes (.text/.rodata/ro)\n",
 		_stext, _etext, len);
+	pr_info("WARP-RI: __v7_setup_stack boot value @%p = %08x\n",
+		__v7_setup_stack, *(u32 *)(__v7_setup_stack + 0x20));
 	kthread_run(warp_ri_thread, NULL, "warp-ri");
 	return 0;
 }

@@ -1298,6 +1298,48 @@ static int warp_shrink_memory(void)
     return 0;
 }
 
+/*
+ * #109/#110 diagnostic: the blob's halt decision (in the SNAPSHOT entry)
+ * returns early unless the word at its *link* address 0xff00ae7c is zero AND
+ * the byte at 0xff00a01e (== param+12 == halt, stored at body 0x1500) is
+ * nonzero.  The blob is linked at 0xff000000 but loaded at warp_hibdrv_addr,
+ * and its body instructions use absolute 0xff00xxxx operands (movw/movt), so
+ * its data mirror lives at those absolute addresses, not at warp_hibdrv_addr
+ * +offset.  Read both so we can see which location the blob actually touches
+ * and which side of the halt test fails on a cold warp.
+ */
+static void warp_dbg_blob(const char *tag)
+{
+    char *b = (char *)warp_hibdrv_addr;
+    u32 abs_a01c = 0, abs_ae7c = 0, abs_ae78 = 0, abs_ae3c = 0;
+    long e1, e2, e3, e4;
+
+    if (!b) {
+        pr_emerg("warp: %s blob=NULL\n", tag);
+        return;
+    }
+    e1 = probe_kernel_read(&abs_a01c, (void *)0xff00a01c, 4);
+    e2 = probe_kernel_read(&abs_ae7c, (void *)0xff00ae7c, 4);
+    e3 = probe_kernel_read(&abs_ae78, (void *)0xff00ae78, 4);
+    e4 = probe_kernel_read(&abs_ae3c, (void *)0xff00ae3c, 4);
+
+    pr_emerg("warp: %s hibdrv=%p drvbuf=%p\n", tag,
+             warp_hibdrv_addr, warp_drv_buf);
+    pr_emerg("warp: %s param sw=%d halt=%d cf=%d os=%d sl=%d stat=%d retry=%d\n",
+             tag, warp_param.switch_mode, warp_param.halt, warp_param.compress,
+             warp_param.oneshot, warp_param.silent,
+             warp_param.stat, warp_param.retry);
+    /* body 0x1458/0x145c = movw/movt r8,#0xa000/#0xff00; if the loader
+     * relocated the blob these become load-base-relative and differ. */
+    pr_emerg("warp: %s code[1458]=%08x code[145c]=%08x (unrel=${e30a8000,e34f8f00})\n",
+             tag, *(u32 *)(b + 0x1458), *(u32 *)(b + 0x145c));
+    pr_emerg("warp: %s ABS a01c=%08x(%ld) ae7c=%08x(%ld) ae78=%08x(%ld) ae3c=%08x(%ld)\n",
+             tag, abs_a01c, e1, abs_ae7c, e2, abs_ae78, e3, abs_ae3c, e4);
+    pr_emerg("warp: %s REL a01c=%08x ae7c=%08x ae78=%08x\n", tag,
+             *(u32 *)(b + 0xa01c), *(u32 *)(b + 0xae7c),
+             *(u32 *)(b + 0xae78));
+}
+
 int hibdrv_snapshot(void)
 {
     int ret;
@@ -1347,9 +1389,16 @@ int hibdrv_snapshot(void)
         warp_param.exttbl = __pa(exttbl);
 
         if (warp_param.switch_mode == 0) {
+            printk(KERN_EMERG "warp: drv snapshot req halt=%d compress=%d oneshot=%d silent=%d\n",
+                   warp_param.halt, warp_param.compress,
+                   warp_param.oneshot, warp_param.silent);
+            warp_dbg_blob("pre");
             if ((ret = WARP_DRV_SNAPSHOT(warp_hibdrv_addr,
                                          &warp_param)) == -ECANCELED)
                 warp_canceled = 1;
+            printk(KERN_EMERG "warp: drv snapshot returned ret=%d stat=%d\n",
+                   ret, warp_param.stat);
+            warp_dbg_blob("post");
         } else {
             int loadf = 1;
             memset(&warp_boot_param, 0, sizeof(warp_boot_param));
@@ -1528,6 +1577,141 @@ static void warp_liveness_start(void)
 	schedule_delayed_work(&warp_live_work, HZ);
 }
 
+/*
+ * Durable resume journal.
+ *
+ * A cold warp ends in a power-off, which discards DRAM and with it the
+ * console-ramoops ring, so after a black-screen cold restore we have no way
+ * to tell how far the resumed kernel got.  This appends one fixed-size
+ * record per resume stage to a scratch area of the warp partition so the
+ * history is still on eMMC after the next (recovery) boot.
+ *
+ * The area is p5+0x18000..0x1a000: the factory image has the driver blob in
+ * [0, 0xa000) and the W5BF bootflag at 0x20000, and everything between is
+ * zero padding, so 16 512-byte slots there clobber nothing the blob uses.
+ *
+ * Writes go to the raw block device rather than through a filesystem: the
+ * resume tail runs with userspace frozen, so an ext4 write could block
+ * forever on a frozen jbd2 kthread.  A block-device write plus vfs_fsync
+ * issues and waits for the I/O in the caller's context instead, and because
+ * it is fsync'd it is on eMMC before the power-off.  filp is opened once, at
+ * hibernate() entry while the system is still fully alive, so no block-device
+ * open/runtime-resume happens during the fragile resume tail.
+ */
+#define WARP_JRNL_DEV		"/dev/mmcblk0p5"
+#define WARP_JRNL_BASE		0x18000UL	/* byte offset within p5 */
+#define WARP_JRNL_SLOTS		16
+#define WARP_JRNL_RECSZ		512
+#define WARP_JRNL_MAGIC		0x4e524a57U	/* "WJRN" */
+
+struct warp_jrnl_rec {
+	u32 magic;
+	u32 seq;
+	u32 jiffies;
+	u32 halt;
+	u32 sw;
+	u32 stat;
+	u32 retry;
+	u32 cold;
+	u32 wstat;
+	u32 wretry;
+	char tag[24];
+};
+
+static struct file *warp_jrnl_filp;
+static u32 warp_jrnl_seq;
+static char warp_jrnl_zero[WARP_JRNL_SLOTS * WARP_JRNL_RECSZ];
+
+static void warp_jrnl_store(const void *buf, size_t len, loff_t off)
+{
+	mm_segment_t oldfs;
+	loff_t pos;
+	int ret;
+
+	if (!warp_jrnl_filp)
+		return;
+	pos = off;
+	oldfs = get_fs();
+	set_fs(KERNEL_DS);
+	ret = vfs_write(warp_jrnl_filp, (void *)buf, len, &pos);
+	if (ret == (int)len)
+		ret = vfs_fsync(warp_jrnl_filp, 0);
+	set_fs(oldfs);
+	if (ret < 0)
+		pr_info("warp-jrnl: write off=%lld ret=%d\n",
+			(long long)off, ret);
+}
+
+static void warp_journal_clear(void)
+{
+	mm_segment_t oldfs;
+
+	if (warp_jrnl_filp) {
+		filp_close(warp_jrnl_filp, 0);
+		warp_jrnl_filp = NULL;
+	}
+	oldfs = get_fs();
+	set_fs(KERNEL_DS);
+	warp_jrnl_filp = filp_open(WARP_JRNL_DEV, O_RDWR, 0);
+	set_fs(oldfs);
+	if (IS_ERR(warp_jrnl_filp)) {
+		pr_info("warp-jrnl: open %s err %ld\n", WARP_JRNL_DEV,
+			PTR_ERR(warp_jrnl_filp));
+		warp_jrnl_filp = NULL;
+		return;
+	}
+	warp_jrnl_seq = 0;
+	warp_jrnl_store(warp_jrnl_zero, sizeof(warp_jrnl_zero),
+			WARP_JRNL_BASE);
+}
+
+static void warp_journal(const char *tag)
+{
+	struct warp_jrnl_rec rec;
+	u32 slot = warp_jrnl_seq++;
+
+	if (slot >= WARP_JRNL_SLOTS)
+		return;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = WARP_JRNL_MAGIC;
+	rec.seq = slot;
+	rec.jiffies = (u32)jiffies;
+	rec.halt = warp_param.halt;
+	rec.sw = warp_param.switch_mode;
+	rec.stat = warp_param.stat;
+	rec.retry = warp_param.retry;
+	rec.cold = warp_pmic_cold_started;
+	rec.wstat = warp_stat;
+	rec.wretry = warp_retry;
+	strncpy(rec.tag, tag, sizeof(rec.tag) - 1);
+
+	warp_jrnl_store(&rec, sizeof(rec),
+			WARP_JRNL_BASE + (loff_t)slot * WARP_JRNL_RECSZ);
+	pr_info("warp-jrnl: %u %s\n", slot, rec.tag);
+}
+
+/*
+ * The W5BF bootflag at p5+0x20000 tells U-Boot to warp-boot the saved image
+ * instead of starting normally.  Every warp resume that returns to the live
+ * session (warm warp, or a cold restore that got this far) must clear it:
+ * leaving it set makes the *next* power-on try a cold restore that, if it
+ * cannot produce a usable session, black-screens on every boot.
+ * The halt=1 save path powers off before reaching here, so the bootflag it
+ * wrote stays intact for U-Boot to consume.
+ */
+#define WARP_BOOTFLAG_OFF	0x20000UL
+#define WARP_BOOTFLAG_SIZE	0x400
+
+static char warp_bootflag_zero[WARP_BOOTFLAG_SIZE];
+
+static void warp_bootflag_clear(void)
+{
+	warp_jrnl_store(warp_bootflag_zero, sizeof(warp_bootflag_zero),
+			WARP_BOOTFLAG_OFF);
+	warp_journal("bf-clear");
+}
+
 int hibernate(void)
 {
     int ret;
@@ -1547,6 +1731,10 @@ int hibernate(void)
     warp_stat = 0;
     warp_retry = 0;
     pm_device_down = WARP_STATE_SUSPEND;
+
+    /* start a fresh resume journal for this warp run */
+    warp_journal_clear();
+    warp_journal("hib-entry");
 
 #ifdef WARP_AMP
     if (warp_amp() && !warp_amp_maincpu())
@@ -1843,6 +2031,22 @@ int hibernate(void)
         warp_retry = warp_param.retry;
     }
 
+    /*
+     * Cold warp: the blob has saved the image and written the W5BF
+     * bootflag, so U-Boot can restore it on the next power-on.  Power the
+     * board off instead of resuming in place.  Only do this when the
+     * snapshot really succeeded (stat == 0); otherwise fall through and
+     * resume, leaving the session intact.
+     */
+    if (warp_param.halt && !ret && warp_param.stat == 0) {
+        printk(KERN_EMERG "warp: cold warp, snapshot ok -> power off\n");
+        if (pm_power_off) {
+            pm_power_off();
+            /* not reached */
+        }
+        printk(KERN_EMERG "warp: no pm_power_off handler, resuming\n");
+    }
+
     pm_device_down = WARP_STATE_RESUME;
     restore_processor_state();
 
@@ -1904,11 +2108,13 @@ warp_device_suspend_err:
 pm_device_suspend_err:
 #endif
     pm_device_resume(STATE_RESTORE);
+    warp_journal("pm-resume");
 #ifndef WARP_SUSPEND_ERR_RECOVER
 pm_device_suspend_err:
 #endif
     printk(KERN_INFO "W22-A dpm_resume returned cold_started=%d\n",
            warp_pmic_cold_started);
+    warp_journal("dev-resume");
 
     if (warp_ops->device_resume_late)
         warp_ops->device_resume_late();
@@ -1927,11 +2133,13 @@ warp_device_suspend_early_err:
     resume_console();
 #endif
     printk(KERN_INFO "W22-B resume_console returned, calling dpm_complete\n");
+    warp_journal("console");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
 dpm_prepare_err:
     dpm_complete(STATE_RESTORE);
     printk(KERN_INFO "W22-C dpm_complete returned\n");
+    warp_journal("dpm-complete");
 
 freeze_kernel_threads_err:
 #endif
@@ -1955,11 +2163,16 @@ freeze_processes_err:
     if (warp_ops->progress)
         warp_ops->progress(WARP_PROGRESS_THAW);
     printk(KERN_INFO "W22-D entering thaw_processes\n");
+    warp_journal("pre-thaw");
     thaw_processes();
     printk(KERN_INFO "W22-E thaw_processes returned\n");
+    warp_journal("post-thaw");
 
     warp_liveness_start();
     printk(KERN_INFO "W22-F liveness scheduled\n");
+    warp_journal("live-start");
+
+    warp_bootflag_clear();
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)

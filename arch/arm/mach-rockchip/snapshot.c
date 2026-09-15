@@ -31,6 +31,10 @@ static u32 grf_os_reg[8], grf_pvtm_con[4], grf_pvtm_status[3];
 static u32 grf_nif_fifo1, grf_usbphy_con[2][8], grf_uoc_status0;
 
 static u32 uart_lcr[3], uart_ier[3], uart_fcr[3], uart_mcr[3], uart_dl[3];
+/* The UARTs are ioremap()ed once at init and reused.  warp_snapshot() runs with
+ * IRQs disabled and the secondary CPUs already offline, and ioremap() kmallocs,
+ * which would sleep there. */
+static void __iomem *warp_uart_map[3];
 static u32 timer[6][5], pmu_regs[18], pwm_regs[4][3];
 
 static unsigned long uart_addrs[] = {
@@ -71,6 +75,26 @@ static void warp_drv_uninit (void)
 
 static void warp_putchar (char c)
 {
+    /* The warp driver's own console is a raw UART with nothing attached on
+     * this board, so its output (save/load progress, "Halted.", error
+     * strings) is otherwise invisible.  Mirror it into the kernel log so it
+     * survives in console-ramoops. */
+    {
+        static char line[192];
+        static int n;
+
+        if (c == '\n' || n >= (int)sizeof(line) - 1) {
+            line[n] = 0;
+            if (n)
+                printk(KERN_EMERG "warpdrv: %s\n", line);
+            n = 0;
+        } else if (c != '\r') {
+            line[n++] = c;
+        }
+    }
+
+    if (!uart_base)
+        return;
 #if 1
     while (!(readl_relaxed(uart_base + 0x7c) & 0x2))
 #else
@@ -95,7 +119,7 @@ static int warp_snapshot (void)
 
     /* UART */
     for (i = 0; i < 3; i++) {
-        uart_addr = ioremap(uart_addrs[i], SZ_8K);
+        uart_addr = warp_uart_map[i];
         if (!uart_addr)
             continue;
         uart_lcr[i] = readl_relaxed(uart_addr + 0x0c);
@@ -110,12 +134,7 @@ static int warp_snapshot (void)
             while (readl_relaxed(uart_addr + 0x7c) & 0x1);
             writel_relaxed(0x03, uart_addr + 0x0c);
         }
-        if (uart_addr)
-            iounmap(uart_addr);
     }
-
-    /* PMIC */
-    warp_rk818_suspend();
 
     /* PWM */
     for (i = 0; i < 4; i++) {
@@ -532,7 +551,17 @@ static int warp_snapshot (void)
     return ret;
 }
 
+/* The PMIC register bank is read over i2c, which sleeps, so it cannot be
+ * captured from warp_snapshot(): that runs with IRQs disabled and the secondary
+ * CPUs already offline.  The pre_snapshot() hook runs before the IRQs go off. */
+static int warp_machine_pre_snapshot (void)
+{
+    warp_rk818_suspend();
+    return 0;
+}
+
 static struct warp_ops warp_machine_ops = {
+    .pre_snapshot = warp_machine_pre_snapshot,
     .snapshot = warp_snapshot,
 #ifdef CONFIG_PM_WARP_DEBUG
     .putc = warp_putchar,
@@ -543,6 +572,11 @@ static struct warp_ops warp_machine_ops = {
 
 static int __init warp_machine_init (void)
 {
+    int i;
+
+    for (i = 0; i < 3; i++)
+        warp_uart_map[i] = ioremap(uart_addrs[i], SZ_8K);
+
     return warp_register_machine(&warp_machine_ops);
 }
 

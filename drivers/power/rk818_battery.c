@@ -4076,6 +4076,11 @@ static int rk818_battery_resume(struct platform_device *dev)
 
 #ifdef CONFIG_PM_WARP
 	if (pm_device_down) {
+		/* init_fg() re-arms the fuel-gauge calibration timer via
+		 * setup_timer(); the one armed before the snapshot is still
+		 * pending, so stop it first or init_timer() trips the
+		 * debugobjects "init active" warning. */
+		del_timer_sync(&di->caltimer);
 		rk818_bat_init_fg(di);
 		rk818_bat_check_charger(di);
 	}

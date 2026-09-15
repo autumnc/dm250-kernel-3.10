@@ -1304,6 +1304,16 @@ int sdio_reset_comm(struct mmc_card *card)
 	int err;
 
 	printk("%s():\n", __func__);
+	/*
+	 * This is the SDIO re-init path.  A prior bus timeout may have marked
+	 * the card removed (the SD_IO_RW_* fast-fail in mmc_wait_for_req_done),
+	 * and mmc_card_removed() then makes __mmc_start_req() short-circuit
+	 * every command below with -ENOMEDIUM.  sdio_reset_comm() exists to
+	 * re-probe the card, so drop the sticky flag or the dongle can never
+	 * be brought back after a warp.
+	 */
+	if (card)
+		card->state &= ~MMC_CARD_REMOVED;
 	mmc_claim_host(host);
 
 	mmc_go_idle(host);

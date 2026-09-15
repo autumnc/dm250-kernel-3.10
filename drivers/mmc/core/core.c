@@ -471,6 +471,23 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
 			dev_err(mmc_dev(host),
 				"req failed (CMD%u): error = %d, timeout = %dms\n",
 				cmd->opcode, cmd->error, timeout);
+			/*
+			 * A wedged SDIO bus must not be hammered once per command.
+			 * This slot is MMC_CAP_NONREMOVABLE, so
+			 * _mmc_detect_card_removed() never marks the card removed
+			 * and every following caller waits the full 8000ms.  A
+			 * bcmdhd teardown over a parked dongle issues ~50 of them
+			 * (~400s).  Once one SDIO transfer has timed out the bus is
+			 * gone, so mark it now and let the rest fail via
+			 * __mmc_start_req().
+			 */
+			if (host->card && !mmc_card_removed(host->card) &&
+			    (cmd->opcode == SD_IO_RW_DIRECT ||
+			     cmd->opcode == SD_IO_RW_EXTENDED)) {
+				mmc_card_set_removed(host->card);
+				dev_err(mmc_dev(host),
+					"SDIO bus dead: marking card removed\n");
+			}
 			if (!cmd->data)
 				break;
 		}

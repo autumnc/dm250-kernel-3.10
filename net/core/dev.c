@@ -1737,7 +1737,12 @@ static void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev)
 
 			if (skb_network_header(skb2) < skb2->data ||
 			    skb2->network_header > skb2->tail) {
-				net_crit_ratelimited("protocol %04x is buggy, dev %s\n",
+				/* Raw AF_PACKET senders (dhcpcd's ETH_P_ALL socket
+				 * among them) leave network_header unset, so this
+				 * fires on every frame they transmit.  It is
+				 * harmless -- we are about to fix the clone up --
+				 * so keep it off the console. */
+				net_dbg_ratelimited("protocol %04x is buggy, dev %s\n",
 						     ntohs(skb2->protocol),
 						     dev->name);
 				skb_reset_network_header(skb2);

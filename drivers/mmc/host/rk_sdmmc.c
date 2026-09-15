@@ -45,6 +45,7 @@
 #include <linux/of.h>
 #include <linux/of_gpio.h>
 #include <linux/mmc/slot-gpio.h>
+#include <linux/warp_param.h>
 #include <linux/clk-private.h>
 #include <linux/rockchip/cpu.h>
 #include <linux/rfkill-wlan.h>
@@ -132,6 +133,44 @@ static int __init warp_mmc_proc_init(void)
 	return 0;
 }
 late_initcall(warp_mmc_proc_init);
+
+/* ============================ WARP-WIFI =================================
+ * Every warp drives mmc2 through the vendor's dw_mci_suspend/resume: suspend
+ * saves the controller registers, clears INTMASK/RINTSTS and tears DMA down,
+ * and resume resets the controller (dw_mci_ctrl_all_reset) and restores them.
+ * That reset is what re-enables the SDIO clock and wakes the AP6210 after
+ * bcmdhd's suspend parked it -- skip it and every CMD52 times out (-110), and
+ * bcmdhd tears the interface down and powers the chip off.
+ *
+ * The one thing a warm warp (halt=0) must NOT do is reload bcmdhd: the card
+ * was never powered down, and tearing the driver down around a live card
+ * hangs SDIO I/O until the soft-lockup watchdog panics.  Only the cold warp
+ * (halt=1), where the board really powered off and lost the firmware, needs
+ * the exit+init reload.
+ * ====================================================================== */
+extern int rockchip_wifi_init_module_rkwifi(void);
+extern void rockchip_wifi_exit_module_rkwifi(void);
+
+static void warp_wifi_reinit_workfn(struct work_struct *w)
+{
+	int i;
+
+	/* This is queued from dw_mci_resume, which runs inside the warp restore's
+	 * dpm_resume; a workqueue thread starts immediately on another CPU and
+	 * races the rest of the device resume.  Wait until the warp has fully
+	 * finished (warp.c sets pm_device_down back to NORMAL at its very end) so
+	 * the reload runs against a settled bus. */
+	for (i = 0; i < 400 && pm_device_down != WARP_STATE_NORMAL; i++)
+		msleep(50);
+
+	pr_info("warp: wifi reinit: bcmdhd module reload (settled after %dms)\n", i * 50);
+	msleep(500);
+	rockchip_wifi_exit_module_rkwifi();
+	msleep(500);
+	rockchip_wifi_init_module_rkwifi();
+	pr_info("warp: wifi reinit: done\n");
+}
+static DECLARE_WORK(warp_wifi_reinit_work, warp_wifi_reinit_workfn);
 #endif /* CONFIG_PM_WARP */
 
 #define DW_MCI_FREQ_MAX	50000000//200000000	/* unit: HZ */
@@ -2229,8 +2268,13 @@ static void dw_mci_post_tmo(struct mmc_host *mmc)
 	}
 
 #ifdef CONFIG_MMC_DW_IDMAC
-	if (host->use_dma && host->dma_ops->init)
-		host->dma_ops->init(host);
+	if (host->use_dma && host->dma_ops->init) {
+		if (host->dma_ops->init(host)) {
+			dev_info(host->dev,
+				"warp: DMA re-init failed in recovery -> PIO fallback\n");
+			host->use_dma = 0;
+		}
+	}
 #endif
 
 	/*
@@ -4453,6 +4497,9 @@ int dw_mci_suspend(struct dw_mci *host)
 		mci_writel(host, INTMASK, 0);
 
 	        if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
+			dev_info(host->dev, "warp: mmc suspend sdio (%s) vmmc=%s use_dma=%d\n",
+				 mmc_hostname(host->mmc), host->vmmc ? "yes" : "no",
+				 host->use_dma);
 			if(host->use_dma && host->dma_ops->exit)
 				host->dma_ops->exit(host);
 
@@ -4524,8 +4571,19 @@ int dw_mci_resume(struct dw_mci *host)
 			if (!dw_mci_ctrl_all_reset(host))
 				return -ENODEV;
 
-			if(host->use_dma && host->dma_ops->init)
-				host->dma_ops->init(host);
+			if(host->use_dma && host->dma_ops->init) {
+				if (host->dma_ops->init(host)) {
+					/* Cold warp power-cycles the external DMA
+					 * controller; if the channel can't be
+					 * re-acquired, dms stays NULL while
+					 * use_dma==1, so every data phase aborts
+					 * and SDIO CMD52 times out (-110).
+					 * Fall back to PIO like dw_mci_init_dma. */
+					dev_info(host->dev,
+						"warp: SDIO DMA re-init failed -> PIO fallback\n");
+					host->use_dma = 0;
+				}
+			}
 
 			mci_writel(host, RINTSTS, 0xFFFFFFFF);
 			mci_writel(host, INTMASK, 0);
@@ -4561,6 +4619,13 @@ int dw_mci_resume(struct dw_mci *host)
 
 	        if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
 			mci_writel(host, INTMASK, host->save_regs.intmask);
+			/* Only a cold warp (halt=1) really powered the board
+			 * off and lost the firmware, so only it needs bcmdhd
+			 * reloaded to re-enumerate the card and re-download.
+			 * The reload is deferred: this runs in the noirq
+			 * resume phase and cannot sleep. */
+			if (pm_device_down == WARP_STATE_RESUME && warp_param.halt)
+				schedule_work(&warp_wifi_reinit_work);
 			return 0;
 		}
 	}
