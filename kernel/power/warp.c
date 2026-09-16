@@ -12,6 +12,7 @@
 #include <linux/suspend.h>
 #include <linux/syscalls.h>
 #include <linux/console.h>
+#include <linux/fb.h>
 #include <linux/cpu.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
@@ -1898,8 +1899,38 @@ void warp_display_selftest(void)
 {
 	rk312x_lcdc_display_off_snapshot();
 	rk31xx_lvds_display_off_snapshot();
-	rk31xx_lvds_display_on();
 	rk312x_lcdc_display_on();
+	rk31xx_lvds_display_on();
+}
+
+/*
+ * A cold warp is saved with the panel blanked (#77: saving with the panel lit
+ * hangs in hibernate()), so the blob carries "panel off" and the restored
+ * session comes up dark.  Clearing that is not the early display restore's job:
+ * blanking is what ran rk_disp_pwr_disable(), and the matching
+ * rk_disp_pwr_enable() needs the panel/backlight GPIO pads to already be muxed
+ * as GPIOs, which does not happen until syscore_resume() puts the pinmux back.
+ * Measured on a restored session: the panel-power line came back, the
+ * backlight-enable line did not.
+ *
+ * So replay what `echo 0 > /sys/class/graphics/fb0/blank` does, late in the
+ * path once syscore_resume() and dpm_resume() are done -- the same fb_blank()
+ * call under the console lock, through the driver's unblank path.
+ */
+static void warp_display_unblank(void)
+{
+	struct fb_info *info = registered_fb[0];
+
+	if (!info || !info->fbops || !info->fbops->fb_blank)
+		return;
+
+	console_lock();
+	info->flags |= FBINFO_MISC_USEREVENT;
+	fb_blank(info, FB_BLANK_UNBLANK);
+	info->flags &= ~FBINFO_MISC_USEREVENT;
+	console_unlock();
+
+	pr_info("warp: cold restore -- fb0 unblanked\n");
 }
 
 /* Called from the blob-return point in snapshot.c (arch rockchip). */
@@ -2326,8 +2357,8 @@ pm_device_power_down_err:
      * before the lcdc/lvds platform resume gets to it.  See the early-display
      * comment above for why this must not move into the IRQs-off window. */
     if (warp_display_early_needed()) {
-        rk31xx_lvds_display_on();
         rk312x_lcdc_display_on();
+        rk31xx_lvds_display_on();
     }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27) && \
@@ -2445,6 +2476,7 @@ freeze_processes_err:
         printk(KERN_EMERG "warp: cold restore -- W5BF disarmed, "
                "bcmdhd reload queued\n");
         warp_wifi_reinit_schedule();
+        warp_display_unblank();
     } else if (warp_keep_bf) {
         warp_cold_mark_set();
         printk(KERN_EMERG "warp: keepbf set -- W5BF left armed at "
@@ -2454,6 +2486,16 @@ freeze_processes_err:
     } else {
         warp_bootflag_clear();
     }
+
+    /*
+     * warp_keep_bf and warp_disp_force are per-warp requests; consume them so
+     * the next warp in this session starts from the default (plain warm, with
+     * nothing left armed).  A keepbf left standing would make a later warm warp
+     * stamp the cold-restore marker again and arm W5BF behind the user's back,
+     * turning the next power-on into a surprise cold restore.
+     */
+    warp_keep_bf = 0;
+    warp_disp_force = 0;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)

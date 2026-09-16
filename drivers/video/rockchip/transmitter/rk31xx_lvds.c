@@ -420,6 +420,15 @@ static struct lvds_reg_data reg_data[] = {
  * second time or the prepare/enable refcount leaks. */
 static int g_lvds_clk_done;
 
+/* Whether the last capture came from a transmitter that was actually running.
+ * Same trap as the LCDC one, one level down the pipe.  A disabled transmitter
+ * has gated the MIPIPHY clock, and forcing the clock back on does not return
+ * the live configuration -- the registers read back the disabled state, with
+ * v_LVDSMODE_EN cleared in RK312X_GRF_LVDS_CON0 (0x30c instead of 0x34c).
+ * Replaying that leaves the transmitter off: the LCDC is programmed correctly
+ * and still nothing reaches the panel, so the screen stays dark. */
+static int g_lvds_cap_live;
+
 static void rk31xx_lvds_warp_save(void)
 {
 	struct rk_lvds_device *lvds = rk31xx_lvds;
@@ -427,6 +436,16 @@ static void rk31xx_lvds_warp_save(void)
 	int i;
 
 	if (!lvds)
+		return;
+
+	/* Only a running transmitter holds state worth capturing.  When it is
+	 * off, keep the previous one and let the enable sequence rebuild the
+	 * hardware from the screen description -- that is what the resume path
+	 * runs.  (The clock is genuinely on whenever clk_on is: the blank path
+	 * clears clk_on, and the suspend path disables the clock only after
+	 * this returns.) */
+	g_lvds_cap_live = lvds->clk_on;
+	if (!g_lvds_cap_live)
 		return;
 
 	for(i = 0; i < ARRAY_SIZE(reg_data); i++){
@@ -448,12 +467,29 @@ static void rk31xx_lvds_warp_restore(void)
 	if (!lvds)
 		return;
 
-	if (lvds->clk_on && !g_lvds_clk_done) {
-		clk_prepare_enable(lvds->pclk);
-		clk_prepare_enable(lvds->ctrl_pclk);
-		clk_prepare_enable(lvds->ctrl_hclk);
+	if (!g_lvds_clk_done) {
+		/*
+		 * The suspend path gated the clocks without clearing clk_on, so
+		 * on the warm path they have to be re-enabled by hand.  On a
+		 * blanked panel clk_on really is 0 and the clock is genuinely
+		 * off -- left off here, every register write below would be
+		 * dropped on the floor.
+		 */
+		if (lvds->clk_on) {
+			clk_prepare_enable(lvds->pclk);
+			clk_prepare_enable(lvds->ctrl_pclk);
+			clk_prepare_enable(lvds->ctrl_hclk);
+		} else {
+			rk31xx_lvds_clk_enable(lvds);
+		}
 		g_lvds_clk_done = 1;
 	}
+
+	/* Nothing was captured (see rk31xx_lvds_warp_save).  Replaying a stale
+	 * image would install the disabled state the capture was refused, and
+	 * the transmitter would stay off.  display_on() brings it up instead. */
+	if (!g_lvds_cap_live)
+		return;
 
 	for(i = 0; i < ARRAY_SIZE(reg_data); i++){
 		tmp = &reg_data[i];
@@ -464,11 +500,28 @@ static void rk31xx_lvds_warp_restore(void)
 	}
 }
 
-/* Bring the LVDS transmitter back on the cold-resume path (see the LCDC
- * counterpart for why this runs before the device tree is resumed). */
+/*
+ * Bring the LVDS transmitter back on the resume path.  When the blob was
+ * written with the panel blanked there is no capture to replay -- the
+ * transmitter was off -- so run the normal enable sequence instead, which
+ * rebuilds the whole thing (clocks, GRF LVDS mode, PLL, lanes) from the screen
+ * description that the blob did restore.
+ */
 void rk31xx_lvds_display_on(void)
 {
-	rk31xx_lvds_warp_restore();
+	struct rk_lvds_device *lvds = rk31xx_lvds;
+
+	if (!lvds)
+		return;
+
+	if (g_lvds_cap_live) {
+		rk31xx_lvds_warp_restore();
+		return;
+	}
+
+	rk31xx_lvds_clk_enable(lvds);
+	g_lvds_clk_done = 1;
+	rk31xx_lvds_en();
 }
 
 /* capture the live registers, for the /proc display self-test round trip */

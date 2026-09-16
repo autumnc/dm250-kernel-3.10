@@ -2994,10 +2994,27 @@ static int hwc_lut_bk[256] = {0};
  * never gated again. */
 static int g_lcdc_clk_done;
 
+/* Whether the last capture came from a controller that was actually running.
+ * A blanked panel has gated the LCDC clock, which powers the block down, and
+ * a powered-down block does not read back its configuration -- it reads back
+ * its power-up defaults.  Those look deceptively sane: a 320x240 window
+ * instead of the all-ones a gated bus returns.  Replaying them leaves window 0
+ * scanning address 0, i.e. a screenful of snow, and because lcdc_writel()
+ * writes the shadow too it poisons regsbak, so no later unblank can recover. */
+static int g_lcdc_cap_live;
+
 void rk312x_lcdc_warp_save(struct lcdc_device *lcdc_dev)
 {
 	int i;
 	int __iomem *c;
+
+	/* Only a live controller holds an image worth capturing.  When it is
+	 * off, keep the previous one and let the unblank path rebuild the
+	 * hardware from the shadow -- regsbak always holds what the driver last
+	 * programmed, clock or no clock. */
+	g_lcdc_cap_live = lcdc_dev->clk_on;
+	if (!g_lcdc_cap_live)
+		return;
 
 	for (i = 0; i < 256; i++) {
 		c = lcdc_dev->dsp_lut_addr_base + i;
@@ -3018,13 +3035,31 @@ void rk312x_lcdc_warp_restore(struct lcdc_device *lcdc_dev)
 	int __iomem *c;
 	int i, v;
 
-	if (lcdc_dev->clk_on && !g_lcdc_clk_done) {
-		clk_prepare_enable(lcdc_dev->hclk);
-		clk_prepare_enable(lcdc_dev->dclk);
-		clk_prepare_enable(lcdc_dev->aclk);
-		clk_prepare_enable(lcdc_dev->pd);
+	if (!g_lcdc_clk_done) {
+		/*
+		 * The suspend path gated the clocks without clearing clk_on,
+		 * so on the warm path they have to be re-enabled by hand.  On a
+		 * blanked panel clk_on really is 0 and the clock is genuinely
+		 * off -- leaving it off here would drop every register write
+		 * below while lcdc_writel() still poisoned regsbak.
+		 */
+		if (lcdc_dev->clk_on) {
+			clk_prepare_enable(lcdc_dev->hclk);
+			clk_prepare_enable(lcdc_dev->dclk);
+			clk_prepare_enable(lcdc_dev->aclk);
+			clk_prepare_enable(lcdc_dev->pd);
+		} else {
+			rk312x_lcdc_clk_enable(lcdc_dev);
+		}
 		g_lcdc_clk_done = 1;
 	}
+
+	/* Nothing was captured (see rk312x_lcdc_warp_save).  Replaying a stale
+	 * image would install a window that no longer matches the framebuffer;
+	 * the shadow is already the right image, and the unblank path writes it
+	 * into the hardware.  Skip the backlight too: the panel was blanked. */
+	if (!g_lcdc_cap_live)
+		return;
 
 	for (i = 0; i < 256; i++) {
 		v = dsp_lut_bk[i];
@@ -3062,11 +3097,37 @@ void rk312x_lcdc_warp_restore(struct lcdc_device *lcdc_dev)
  */
 void rk312x_lcdc_display_on(void)
 {
+	struct rk_lcdc_driver *dev_drv;
+
 	if (!g_lcdc)
 		return;
 
-	rk_disp_pwr_enable(&g_lcdc->driver);	/* panel power (lcd_cs) */
-	rk312x_lcdc_warp_restore(g_lcdc);
+	dev_drv = &g_lcdc->driver;
+
+	rk_disp_pwr_enable(dev_drv);		/* panel power (lcd_cs) */
+
+	if (g_lcdc_cap_live) {
+		rk312x_lcdc_warp_restore(g_lcdc);
+	} else {
+		/* The blob was written with the panel blanked, so nothing was
+		 * captured and the controller has just come up from power-on.
+		 * The driver's shadow is the image: write it out and rebuild the
+		 * LUTs from the screen description. */
+		rk312x_lcdc_clk_enable(g_lcdc);
+		g_lcdc_clk_done = 1;
+		rk312x_lcdc_reg_restore(g_lcdc);
+		if (dev_drv->cur_screen && dev_drv->cur_screen->dsp_lut)
+			rk312x_lcdc_set_lut(dev_drv, dev_drv->cur_screen->dsp_lut);
+		rk312x_lcdc_set_hwc_lut(dev_drv, dev_drv->hwc_lut, 0);
+	}
+
+	/* the capture can have been taken with the panel blanked, in which
+	 * case the replayed state is a standby controller -- bring it back lit
+	 * instead of waiting for the later unblank. */
+	lcdc_msk_reg(g_lcdc, DSP_CTRL1, m_DSP_OUT_ZERO, v_DSP_OUT_ZERO(0));
+	lcdc_msk_reg(g_lcdc, SYS_CTRL, m_LCDC_STANDBY, v_LCDC_STANDBY(0));
+	lcdc_msk_reg(g_lcdc, DSP_CTRL1, m_BLANK_EN, v_BLANK_EN(0));
+	lcdc_cfg_done(g_lcdc);
 }
 
 /* capture the live registers, for the /proc display self-test round trip */
