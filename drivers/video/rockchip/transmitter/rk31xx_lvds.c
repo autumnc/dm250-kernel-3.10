@@ -383,7 +383,7 @@ err_screen_type:
 }
 
 static int rk31xx_lvds_remove(struct platform_device *pdev)
-{	
+{
 	return 0;
 }
 #ifdef CONFIG_PM
@@ -414,29 +414,83 @@ static struct lvds_reg_data reg_data[] = {
 	{RK312X_GRF_SOC_CON1    , GRF_REG, 0},
 	{0x00e8                 , GRF_REG, 0},
 };
+
+/* clocks are brought back once per warp cycle: the cold-resume path enables
+ * them early (rk31xx_lvds_display_on), the normal resume must not enable a
+ * second time or the prepare/enable refcount leaks. */
+static int g_lvds_clk_done;
+
+static void rk31xx_lvds_warp_save(void)
+{
+	struct rk_lvds_device *lvds = rk31xx_lvds;
+	struct lvds_reg_data *tmp;
+	int i;
+
+	if (!lvds)
+		return;
+
+	for(i = 0; i < ARRAY_SIZE(reg_data); i++){
+		tmp = &reg_data[i];
+
+		if(tmp->flag)
+			tmp->data = grf_readl(tmp->reg);
+		else
+			tmp->data = lvds_readl(lvds, tmp->reg);
+	}
+}
+
+static void rk31xx_lvds_warp_restore(void)
+{
+	struct rk_lvds_device *lvds = rk31xx_lvds;
+	struct lvds_reg_data *tmp;
+	int i;
+
+	if (!lvds)
+		return;
+
+	if (lvds->clk_on && !g_lvds_clk_done) {
+		clk_prepare_enable(lvds->pclk);
+		clk_prepare_enable(lvds->ctrl_pclk);
+		clk_prepare_enable(lvds->ctrl_hclk);
+		g_lvds_clk_done = 1;
+	}
+
+	for(i = 0; i < ARRAY_SIZE(reg_data); i++){
+		tmp = &reg_data[i];
+		if(tmp->flag)
+			grf_writel(tmp->data, tmp->reg);
+		else
+			lvds_writel(lvds, tmp->reg, tmp->data);
+	}
+}
+
+/* Bring the LVDS transmitter back on the cold-resume path (see the LCDC
+ * counterpart for why this runs before the device tree is resumed). */
+void rk31xx_lvds_display_on(void)
+{
+	rk31xx_lvds_warp_restore();
+}
+
+/* capture the live registers, for the /proc display self-test round trip */
+void rk31xx_lvds_display_off_snapshot(void)
+{
+	rk31xx_lvds_warp_save();
+}
+
 static int rk312x_lvds_suspend(struct platform_device *pdev, pm_message_t state)
 {
 #ifdef CONFIG_PM_WARP
 	struct rk_lvds_device *lvds = rk31xx_lvds;
-	int i;
-	struct lvds_reg_data *tmp;
 
-	if (pm_device_down) {
-
-		for(i = 0; i < ARRAY_SIZE(reg_data); i++){
-			tmp = &reg_data[i];
-
-			if(tmp->flag)
-				tmp->data = grf_readl(tmp->reg);
-			else
-				tmp->data = lvds_readl(lvds, tmp->reg);
-		}
+	if (pm_device_down && lvds) {
+		rk31xx_lvds_warp_save();
 
 		if(lvds->clk_on){
 			clk_disable_unprepare(lvds->pclk);
 			clk_disable_unprepare(lvds->ctrl_hclk);
 			clk_disable_unprepare(lvds->ctrl_pclk);
 		}
+		g_lvds_clk_done = 0;
 	}
 #endif
 	return 0;
@@ -444,26 +498,14 @@ static int rk312x_lvds_suspend(struct platform_device *pdev, pm_message_t state)
 static int rk312x_lvds_resume(struct platform_device *pdev)
 {
 #ifdef CONFIG_PM_WARP
-	struct rk_lvds_device *lvds = rk31xx_lvds;
-	struct lvds_reg_data *tmp;
-	int i;
-	if (pm_device_down) {
-		if(lvds->clk_on){
-			clk_prepare_enable(lvds->pclk);
-			clk_prepare_enable(lvds->ctrl_pclk);
-			clk_prepare_enable(lvds->ctrl_hclk);
-		}
-		for(i = 0; i < ARRAY_SIZE(reg_data); i++){
-			tmp = &reg_data[i];
-			if(tmp->flag)
-				grf_writel(tmp->data, tmp->reg);
-			else
-				lvds_writel(lvds, tmp->reg, tmp->data);
-		}
-	}
+	if (pm_device_down)
+		rk31xx_lvds_warp_restore();
 #endif
 	return 0;
 }
+#else
+void rk31xx_lvds_display_on(void) {}
+void rk31xx_lvds_display_off_snapshot(void) {}
 #endif
 
 static void rk31xx_lvds_shutdown(struct platform_device *pdev)

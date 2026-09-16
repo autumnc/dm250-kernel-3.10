@@ -18,6 +18,7 @@
 #include <linux/version.h>
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
+#include <linux/fb.h>
 #include <linux/warp_param.h>
 #include <linux/workqueue.h>
 #include <asm/uaccess.h>
@@ -25,6 +26,12 @@
 /* set by warp_rk818_resume() in drivers/mfd/rk818.c during the machine-HAL
  * cold restore; consulted here only for diagnostics */
 extern int warp_pmic_cold_started;
+
+/* implemented by the display drivers; used by the cold-resume checkpoint */
+extern void rk312x_lcdc_display_on(void);
+extern void rk312x_lcdc_display_off_snapshot(void);
+extern void rk31xx_lvds_display_on(void);
+extern void rk31xx_lvds_display_off_snapshot(void);
 
 #ifdef CONFIG_MTD
 #undef DEBUG
@@ -48,6 +55,8 @@ extern int warp_pmic_cold_started;
 #endif
 
 #include "power.h"
+
+#include <linux/rockchip/iomap.h>
 
 #ifndef WARP_WORK_SIZE
 #define WARP_WORK_SIZE          (128 * 1024)
@@ -1642,6 +1651,26 @@ static void warp_jrnl_store(const void *buf, size_t len, loff_t off)
 			(long long)off, ret);
 }
 
+static int warp_jrnl_load(void *buf, size_t len, loff_t off)
+{
+	mm_segment_t oldfs;
+	loff_t pos = off;
+	int ret;
+
+	if (!warp_jrnl_filp)
+		return -ENODEV;
+	oldfs = get_fs();
+	set_fs(KERNEL_DS);
+	ret = vfs_llseek(warp_jrnl_filp, off, SEEK_SET);
+	if (ret >= 0)
+		ret = vfs_read(warp_jrnl_filp, buf, len, &pos);
+	set_fs(oldfs);
+	if (ret < 0)
+		pr_info("warp-jrnl: read off=%lld ret=%d\n",
+			(long long)off, ret);
+	return ret;
+}
+
 static void warp_journal_clear(void)
 {
 	mm_segment_t oldfs;
@@ -1693,28 +1722,201 @@ static void warp_journal(const char *tag)
 
 /*
  * The W5BF bootflag at p5+0x20000 tells U-Boot to warp-boot the saved image
- * instead of starting normally.  Every warp resume that returns to the live
- * session (warm warp, or a cold restore that got this far) must clear it:
- * leaving it set makes the *next* power-on try a cold restore that, if it
- * cannot produce a usable session, black-screens on every boot.
- * The halt=1 save path powers off before reaching here, so the bootflag it
- * wrote stays intact for U-Boot to consume.
+ * instead of starting normally.  A warp resume that returns to the live
+ * session (warm warp, or a cold restore that got this far) clears it by
+ * default: leaving it set makes the *next* power-on try a cold restore that,
+ * if it cannot produce a usable session, black-screens on every boot.
+ *
+ * The exception is an intentional cold warp: /proc/warp/keepbf suppresses the
+ * clear so a plain save (`echo disk`) leaves U-Boot the armed bootflag it
+ * needs, and the power-off that follows is an ordinary one.
  */
 #define WARP_BOOTFLAG_OFF	0x20000UL
 #define WARP_BOOTFLAG_SIZE	0x400
 
 static char warp_bootflag_zero[WARP_BOOTFLAG_SIZE];
 
+/*
+ * #134 diagnostic: U-Boot cold-restores only when it finds a W5BF block at
+ * p5+0x20000, and the blob is the only writer of it.  Whether the blob wrote
+ * one -- and with which snapshot_id -- is therefore the whole question of a
+ * cold warp, and it cannot be answered by looking at the image afterwards
+ * because the halt branch powers the board off right here.
+ */
+static char warp_bootflag_dump_buf[WARP_BOOTFLAG_SIZE];
+
+static void warp_bootflag_dump(const char *when)
+{
+	const u32 *w = (const u32 *)warp_bootflag_dump_buf;
+	int ret;
+
+	ret = warp_jrnl_load(warp_bootflag_dump_buf,
+			     sizeof(warp_bootflag_dump_buf), WARP_BOOTFLAG_OFF);
+	pr_info("warp-bf: %s ret=%d id=%08x sid=%08x +68=%08x\n",
+		when, ret, w[0], w[1], w[0x68 / 4]);
+	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+		w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+		w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+		w[24], w[25], w[26], w[27], w[28], w[29], w[30], w[31]);
+}
+
 static void warp_bootflag_clear(void)
 {
+	warp_bootflag_dump("pre-clear");
 	warp_jrnl_store(warp_bootflag_zero, sizeof(warp_bootflag_zero),
 			WARP_BOOTFLAG_OFF);
 	warp_journal("bf-clear");
 }
 
+/*
+ * Cold-resume flight recorder.
+ *
+ * A cold warp powers the board off (from userspace; see the note in
+ * hibernate()), U-Boot restores the image on the next power-on, and the
+ * kernel resumes from the blob-return point.  Everything in that window runs
+ * with the mmc host still frozen, so the warp journal (block I/O on
+ * /dev/mmcblk0p5) cannot record it, and i2c to the RK818 is dead there too.
+ *
+ * SYS_REG2 was meant to be the medium that spans save -> power-off -> restore,
+ * but that hypothesis is dead: the rk818 soft power-off drops the whole SoC,
+ * so the PMU block does not survive it (measured: a bit written at boot came
+ * back 0 after a real poweroff, while it survived a warm reboot).  The
+ * counters are kept only as a warm-reboot-granularity diagnostic; SYS_REG2
+ * is reset at the top of every hibernate() and SYS_REG3 is retired.
+ */
+#define WARP_SR_STAGE	(RK_PMU_VIRT + 0x40)	/* RK312X_PMU_SYS_REG2 */
+#define WARP_SR_HALT	(RK_PMU_VIRT + 0x44)	/* RK312X_PMU_SYS_REG3 (retired) */
+
+#define WARP_SR_HIB_ENTRY	0x01	/* hibernate() entered (save side) */
+#define WARP_SR_BLOB_RET	0x02	/* blob returned (save or restore) */
+#define WARP_SR_WARP_RET	0x04	/* back in hibernate() after snapshot */
+#define WARP_SR_PM_RESUME	0x10	/* pm_device_resume() done (block I/O live) */
+#define WARP_SR_BF_CLEAR	0x20	/* bootflag cleared (full resume reached) */
+#define WARP_SR_BOOTED		0x80000000u	/* a normal boot ran warp_init */
+
+static void warp_sr_mark(u32 bit)
+{
+	writel(readl(WARP_SR_STAGE) | bit, WARP_SR_STAGE);
+}
+
+/*
+ * Cold-resume display checkpoint.
+ *
+ * A cold-restored session has no console, no usable network and no
+ * persistent scratch medium, so the panel is the only observable output.
+ * A colour band is painted across the top of the framebuffer at each stage
+ * of the resume path that is still reachable, and the display chain is
+ * brought back at the same time, so the band records how far the restorer
+ * got without needing a serial port:
+ *
+ *   (black)         -> hung before local_irq_enable(): the blob hand-off, the
+ *                      snapshot.c resume section (CRU/GRF/timer/PMIC/UART),
+ *                      or syscore_resume()
+ *   0xff0000 red    -> local_irq_enable() reached, display chain restored
+ *                      (LCDC + LVDS + backlight)
+ *   0xffff00 yellow -> pm_device_resume() returned (devices, incl. SDIO)
+ *   0xffffff white  -> whole resume path traversed
+ *
+ * The display bring-up must NOT move earlier than local_irq_enable(): it
+ * takes clocks, a mutex-backed backlight device and possibly an IOVMM
+ * activation, all of which may sleep, and the window between
+ * local_irq_disable() and local_irq_enable() is atomic.  Doing it there hung
+ * the warm warp outright (kernel #130: logo flash, then a dead panel).
+ *
+ * Painting is enabled only for a warp that was armed as a cold one
+ * (warp_param.halt, or /proc/warp/earlydisp), so the default warm warp is
+ * left untouched.  A cold warp sets earlydisp before the save, which puts
+ * warp_disp_force into the saved image as well, so the restored kernel paints
+ * too.  See the cold-warp recipe next to warp_keep_bf.
+ */
+int warp_disp_force;		/* /proc/warp/earlydisp */
+
+/*
+ * /proc/warp/keepbf: do not clear the W5BF bootflag at the end of the resume
+ * path.  This is how a cold warp is set up: a plain save (`echo disk`) writes
+ * a W5BF block with a snapshot_id matching the W5S1 image, and U-Boot
+ * cold-restores on the next power-on *only* while that block is present.  By
+ * default the resume path clears it -- a warm warp must not leave the device
+ * set up to warp-boot a session that is already live -- so arming a cold warp
+ * means doing a save with this set and then powering off normally.
+ */
+int warp_keep_bf;		/* /proc/warp/keepbf */
+
+int warp_display_early_needed(void)
+{
+	return warp_param.halt || warp_disp_force;
+}
+
+static void warp_disp_paint(u32 color)
+{
+#ifdef CONFIG_FB
+	struct fb_info *info = registered_fb[0];
+	u32 xres, yres, band, x, y;
+	int stride;
+	u32 *p;
+
+	if (!info || !info->screen_base)
+		return;
+	if (info->var.bits_per_pixel != 32)
+		return;
+
+	xres = info->var.xres;
+	yres = info->var.yres;
+	if (!xres || !yres)
+		return;
+
+	stride = info->fix.line_length >> 2;
+	if (stride < (int)xres)
+		return;
+
+	band = yres / 10;
+	if (band < 1)
+		band = 1;
+
+	for (y = 0; y < band; y++) {
+		p = (u32 *)info->screen_base + y * stride;
+		for (x = 0; x < xres; x++)
+			p[x] = color;
+	}
+#else
+	(void)color;
+#endif
+}
+
+void warp_disp_ckpt(u32 color)
+{
+	if (warp_display_early_needed())
+		warp_disp_paint(color);
+}
+
+/*
+ * /proc/warp/earlydisp == 2: capture the live display registers and run the
+ * restore sequence straight back over them, in normal process context.  A
+ * broken register sequence is then caught on a healthy system instead of
+ * costing a cold warp.  The band repainted magenta is the "it ran" marker;
+ * the rest of the picture staying intact is the "it is correct" marker.
+ */
+void warp_display_selftest(void)
+{
+	rk312x_lcdc_display_off_snapshot();
+	rk31xx_lvds_display_off_snapshot();
+	rk31xx_lvds_display_on();
+	rk312x_lcdc_display_on();
+	warp_disp_paint(0x00ff00ff);
+}
+
+/* Called from the blob-return point in snapshot.c (arch rockchip). */
+void warp_sr_blob_ret(void)
+{
+	warp_sr_mark(WARP_SR_BLOB_RET);
+}
+
 int hibernate(void)
 {
     int ret;
+    int cold = 0;
 
     if (!warp_ops) {
         printk("Snapshot driver not found.\n");
@@ -1735,6 +1937,12 @@ int hibernate(void)
     /* start a fresh resume journal for this warp run */
     warp_journal_clear();
     warp_journal("hib-entry");
+
+    /* start a fresh cold-resume trace (halt counter too: it must be 0 so a
+     * restore-side re-run of the halt branch shows up as a second hit) */
+    writel_relaxed(0, WARP_SR_STAGE);
+    writel_relaxed(0, WARP_SR_HALT);
+    warp_sr_mark(WARP_SR_HIB_ENTRY);
 
 #ifdef WARP_AMP
     if (warp_amp() && !warp_amp_maincpu())
@@ -2026,26 +2234,63 @@ int hibernate(void)
     else
         warp_swapout_disable = 0;
 #endif
+    /*
+     * #134: keep halt out of both the blob call and the saved image.
+     *
+     * U-Boot cold-restores only if it finds a W5BF bootflag at p5+0x20000,
+     * and the blob is the only writer of it.  On a halt=1 save the blob here
+     * reports stat=1 and leaves that block zero, so every cold warp so far
+     * ended in a plain U-Boot boot; the same blob on a plain save (halt=0,
+     * the `echo disk` path) reports stat=0.  Clearing halt for the call makes
+     * it take the plain-save path, which is the one that writes W5BF.
+     *
+     * The saved image must not carry halt either: the resume path has three
+     * halt-gated steps (display bring-up, rk818 pre_init, SDIO re-enumeration)
+     * that a cold-restored kernel has to take, and a halt=0 image would skip
+     * them.  The checkpoint painting therefore hangs off warp_disp_force from
+     * here on, because warp_display_early_needed() would otherwise see the
+     * zeroed halt in the restored image and skip the display bring-up.
+     *
+     * `cold` is now only informational: it no longer selects a power-off,
+     * because hibernate() no longer powers off at all (see below).
+     */
+    cold = warp_param.halt;
+    if (cold) {
+        warp_disp_force = 1;
+        warp_param.halt = 0;
+        printk(KERN_EMERG "warp: cold warp: halt cleared for save "
+               "(compress=%d switch=%d)\n",
+               warp_param.compress, warp_param.switch_mode);
+    }
+
     if ((ret = warp_ops->snapshot()) == 0) {
         warp_stat = warp_param.stat;
         warp_retry = warp_param.retry;
     }
+    warp_sr_mark(WARP_SR_WARP_RET);
 
     /*
-     * Cold warp: the blob has saved the image and written the W5BF
-     * bootflag, so U-Boot can restore it on the next power-on.  Power the
-     * board off instead of resuming in place.  Only do this when the
-     * snapshot really succeeded (stat == 0); otherwise fall through and
-     * resume, leaving the session intact.
+     * There is deliberately NO power-off here -- this is what the vendor
+     * kernel does too (its hibernate() has no power-off branch at all; the
+     * only caller of pm_power_off is the ordinary shutdown path).
+     *
+     * A cold warp is a save followed by an ordinary `poweroff`, not a
+     * power-off from inside hibernate().  It has to be that way: a
+     * cold-restored kernel resumes at the blob-return point, so everything in
+     * this function after the snapshot is replayed on the restore side with
+     * the saved DRAM.  A power-off branch here therefore fires again on every
+     * restore -- and #134's halt=1 cold warp did exactly that.  U-Boot did
+     * hand off to the blob (screen went black, journal stopped at
+     * "hib-entry"), but the restored kernel reached this branch, called
+     * rk818_device_shutdown() against a PMIC that is not fully up yet, and
+     * died with the panel still lit instead of either resuming or powering
+     * off again.
+     *
+     * What makes U-Boot restore an image is the W5BF bootflag at p5+0x20000
+     * being left armed when the board powers off.  That is a userspace
+     * decision (see /proc/warp/keepbf), not something hibernate() can do by
+     * itself.
      */
-    if (warp_param.halt && !ret && warp_param.stat == 0) {
-        printk(KERN_EMERG "warp: cold warp, snapshot ok -> power off\n");
-        if (pm_power_off) {
-            pm_power_off();
-            /* not reached */
-        }
-        printk(KERN_EMERG "warp: no pm_power_off handler, resuming\n");
-    }
 
     pm_device_down = WARP_STATE_RESUME;
     restore_processor_state();
@@ -2070,6 +2315,16 @@ pm_device_power_down_err:
 #endif
 
     local_irq_enable();
+
+    /* Earliest point where sleeping is legal again.  Bring the panel back and
+     * leave a red band: if this ran, the blob hand-off and the whole
+     * snapshot.c resume section completed.  See the checkpoint comment above
+     * for why this must not move into the IRQs-off window. */
+    if (warp_display_early_needed()) {
+        rk31xx_lvds_display_on();
+        rk312x_lcdc_display_on();
+        warp_disp_ckpt(0xff0000);	/* red: display chain restored */
+    }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,30)
@@ -2109,6 +2364,8 @@ pm_device_suspend_err:
 #endif
     pm_device_resume(STATE_RESTORE);
     warp_journal("pm-resume");
+    warp_sr_mark(WARP_SR_PM_RESUME);
+    warp_disp_ckpt(0xffff00);		/* yellow: devices restored */
 #ifndef WARP_SUSPEND_ERR_RECOVER
 pm_device_suspend_err:
 #endif
@@ -2172,7 +2429,16 @@ freeze_processes_err:
     printk(KERN_INFO "W22-F liveness scheduled\n");
     warp_journal("live-start");
 
-    warp_bootflag_clear();
+    warp_sr_mark(WARP_SR_BF_CLEAR);
+    if (warp_keep_bf) {
+        printk(KERN_EMERG "warp: keepbf set -- W5BF left armed at "
+               "p5+0x%lx so U-Boot restores this image on the next power-on\n",
+               WARP_BOOTFLAG_OFF);
+        warp_bootflag_dump("keepbf");
+    } else {
+        warp_bootflag_clear();
+    }
+    warp_disp_ckpt(0xffffff);		/* white: full resume path traversed */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)
@@ -2273,6 +2539,8 @@ static struct proc_dir_entry *proc_warp_division;
 static struct proc_dir_entry *proc_warp_oneshot;
 static struct proc_dir_entry *proc_warp_halt;
 static struct proc_dir_entry *proc_warp_silent;
+static struct proc_dir_entry *proc_warp_earlydisp;
+static struct proc_dir_entry *proc_warp_keepbf;
 #if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
 static struct proc_dir_entry *proc_warp_tmr_fault;
 #endif
@@ -2400,6 +2668,81 @@ PROC_RW(separate, warp_separate, "separate", 0, 2, separate_pass_init)
 PROC_RW(oneshot, warp_param.oneshot, "oneshot", 0, 1, dummy)
 PROC_RW(halt, warp_param.halt, "halt", 0, 1, dummy)
 PROC_RW(silent, warp_param.silent, "silent", 0, 3, dummy)
+
+/*
+ * /proc/warp/earlydisp
+ *   0  early display restore disabled (default; warm warp unchanged)
+ *   1  force it on the warm path too, so a warm warp exercises it end to end
+ *   2  run the capture+restore display self-test right now
+ */
+static ssize_t read_proc_warp_earlydisp(struct file *file,
+                                        char __user *buffer,
+                                        size_t count, loff_t *offset)
+{
+    return read_proc_warp(buffer, count, offset, warp_disp_force);
+}
+
+static ssize_t write_proc_warp_earlydisp(struct file *file,
+                                         const char __user *buffer,
+                                         size_t count, loff_t *offset)
+{
+    int err, val;
+
+    if ((err = write_proc_warp(buffer, count, offset, 0, 2, &val,
+                               "earlydisp")) < 0)
+        return err;
+
+    if (val == 2) {
+        printk(KERN_INFO "warp: display self-test (capture + restore)\n");
+        warp_display_selftest();
+    } else {
+        warp_disp_force = val;
+        printk(KERN_INFO "warp: early display restore %s\n",
+               val ? "forced on" : "off");
+    }
+
+    return count;
+}
+
+static const struct file_operations proc_warp_earlydisp_fops =
+{
+    .read  = read_proc_warp_earlydisp,
+    .write = write_proc_warp_earlydisp,
+};
+
+/*
+ * /proc/warp/keepbf
+ *   0  clear the W5BF bootflag at the end of the resume path (default)
+ *   1  leave it armed, so the next power-on is a U-Boot cold restore
+ */
+static ssize_t read_proc_warp_keepbf(struct file *file,
+                                     char __user *buffer,
+                                     size_t count, loff_t *offset)
+{
+    return read_proc_warp(buffer, count, offset, warp_keep_bf);
+}
+
+static ssize_t write_proc_warp_keepbf(struct file *file,
+                                      const char __user *buffer,
+                                      size_t count, loff_t *offset)
+{
+    int err, val;
+
+    if ((err = write_proc_warp(buffer, count, offset, 0, 1, &val,
+                               "keepbf")) < 0)
+        return err;
+
+    warp_keep_bf = val;
+    printk(KERN_INFO "warp: bootflag clear at resume end %s\n",
+           val ? "suppressed (keepbf)" : "enabled");
+    return count;
+}
+
+static const struct file_operations proc_warp_keepbf_fops =
+{
+    .read  = read_proc_warp_keepbf,
+    .write = write_proc_warp_keepbf,
+};
 
 #if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
 /*
@@ -2568,6 +2911,10 @@ static int __init warp_init(void)
             warp_proc_create("oneshot", 1, &proc_warp_oneshot_fops);
         proc_warp_halt = warp_proc_create("halt", 1, &proc_warp_halt_fops);
         proc_warp_silent = warp_proc_create("silent", 1, &proc_warp_silent_fops);
+        proc_warp_earlydisp =
+            warp_proc_create("earlydisp", 1, &proc_warp_earlydisp_fops);
+        proc_warp_keepbf =
+            warp_proc_create("keepbf", 1, &proc_warp_keepbf_fops);
 #if defined(CONFIG_PM_WARP) && defined(CONFIG_WARP_DIAG)
         proc_warp_tmr_fault =
             warp_proc_create("tmr_fault", 1, &proc_warp_tmr_fault_fops);
@@ -2618,6 +2965,22 @@ static int __init warp_init(void)
             return ret;
     }
 #endif
+    /*
+     * Cold-resume flight recorder readout, plus a persistence self-test: the
+     * WARP_SR_BOOTED bit written here survives the rk818 soft power-off only
+     * if the PMU scratch really is in the always-on domain, so a set
+     * prev_boot=1 after a plain power cycle proves the medium works.
+     */
+    {
+        u32 stage = readl_relaxed(WARP_SR_STAGE);
+
+        printk(KERN_INFO "warp-scratch: stage=%08x halt=%u prev_boot=%d\n",
+               stage & ~WARP_SR_BOOTED,
+               readl_relaxed(WARP_SR_HALT),
+               !!(stage & WARP_SR_BOOTED));
+        writel_relaxed(stage | WARP_SR_BOOTED, WARP_SR_STAGE);
+    }
+
     printk(KERN_INFO "Lineo Warp!! module loaded\n");
 
     return 0;
@@ -2687,6 +3050,14 @@ static void __exit warp_exit(void)
     if (proc_warp_silent) {
         remove_proc_entry("silent", proc_warp_silent);
         proc_warp_silent = NULL;
+    }
+    if (proc_warp_earlydisp) {
+        remove_proc_entry("earlydisp", proc_warp_earlydisp);
+        proc_warp_earlydisp = NULL;
+    }
+    if (proc_warp_keepbf) {
+        remove_proc_entry("keepbf", proc_warp_keepbf);
+        proc_warp_keepbf = NULL;
     }
     if (proc_warp) {
         remove_proc_entry("warp", proc_warp);

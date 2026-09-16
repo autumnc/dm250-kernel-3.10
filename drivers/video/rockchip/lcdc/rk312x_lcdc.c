@@ -2888,6 +2888,11 @@ static int rk312x_lcdc_parse_dt(struct lcdc_device *lcdc_dev)
 	return 0;
 }
 
+#if defined(CONFIG_PM)
+/* the lcdc instance, kept for the early cold-resume display restore */
+static struct lcdc_device *g_lcdc;
+#endif
+
 static int rk312x_lcdc_probe(struct platform_device *pdev)
 {
 	struct lcdc_device *lcdc_dev = NULL;
@@ -2902,6 +2907,9 @@ static int rk312x_lcdc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	platform_set_drvdata(pdev, lcdc_dev);
+#if defined(CONFIG_PM)
+	g_lcdc = lcdc_dev;
+#endif
 	lcdc_dev->dev = dev;
 	if (rk312x_lcdc_parse_dt(lcdc_dev)) {
 		dev_err(lcdc_dev->dev, "rk312x lcdc parse dt failed!\n");
@@ -2979,22 +2987,17 @@ err_parse_dt:
 static u32 reg_bk[0x3d] = {0};
 static int dsp_lut_bk[256] = {0};
 static int hwc_lut_bk[256] = {0};
-static int rk312x_lcdc_suspend(struct platform_device *pdev, pm_message_t state)
+
+/* clocks are brought back once per warp cycle: the cold-resume path enables
+ * them early (rk312x_lcdc_display_on), the normal resume must not enable a
+ * second time or the prepare/enable refcount leaks and the display clock is
+ * never gated again. */
+static int g_lcdc_clk_done;
+
+void rk312x_lcdc_warp_save(struct lcdc_device *lcdc_dev)
 {
 	int i;
-	struct lcdc_device *lcdc_dev = platform_get_drvdata(pdev);
-	struct rk_lcdc_driver *dev_drv = &lcdc_dev->driver;
 	int __iomem *c;
-
-	rk312x_lcdc_get_backlight_device(dev_drv);
-	if (lcdc_dev->backlight) {
-		lcdc_dev->backlight->props.fb_blank = FB_BLANK_POWERDOWN;
-		backlight_update_status(lcdc_dev->backlight);
-	}
-
-	if (dev_drv->iommu_enabled) {
-		rockchip_iovmm_deactivate(dev_drv->dev);
-	}
 
 	for (i = 0; i < 256; i++) {
 		c = lcdc_dev->dsp_lut_addr_base + i;
@@ -3005,33 +3008,22 @@ static int rk312x_lcdc_suspend(struct platform_device *pdev, pm_message_t state)
 		hwc_lut_bk[i] = readl_relaxed(c);
 	}
 
-	for(i = 0; i < 0x3d; i++){
-		reg_bk[i] = lcdc_readl(lcdc_dev, i*4);
-	}
-
-	if(lcdc_dev->clk_on){
-		clk_disable_unprepare(lcdc_dev->dclk);
-		clk_disable_unprepare(lcdc_dev->hclk);
-		clk_disable_unprepare(lcdc_dev->aclk);
-		clk_disable_unprepare(lcdc_dev->pd);
-	}
-
-	return 0;
+	for (i = 0; i < 0x3d; i++)
+		reg_bk[i] = lcdc_readl(lcdc_dev, i * 4);
 }
 
-static int rk312x_lcdc_resume(struct platform_device *pdev)
+void rk312x_lcdc_warp_restore(struct lcdc_device *lcdc_dev)
 {
-	int i;
-	struct lcdc_device *lcdc_dev = platform_get_drvdata(pdev);
 	struct rk_lcdc_driver *dev_drv = &lcdc_dev->driver;
 	int __iomem *c;
-	int v;
+	int i, v;
 
-	if (lcdc_dev->clk_on) {
+	if (lcdc_dev->clk_on && !g_lcdc_clk_done) {
 		clk_prepare_enable(lcdc_dev->hclk);
 		clk_prepare_enable(lcdc_dev->dclk);
 		clk_prepare_enable(lcdc_dev->aclk);
 		clk_prepare_enable(lcdc_dev->pd);
+		g_lcdc_clk_done = 1;
 	}
 
 	for (i = 0; i < 256; i++) {
@@ -3046,9 +3038,8 @@ static int rk312x_lcdc_resume(struct platform_device *pdev)
 		writel_relaxed(v, c);
 	}
 
-	for(i = 0; i < 0x3d; i++){
-		lcdc_writel(lcdc_dev, i*4, reg_bk[i]);
-	}
+	for (i = 0; i < 0x3d; i++)
+		lcdc_writel(lcdc_dev, i * 4, reg_bk[i]);
 	lcdc_cfg_done(lcdc_dev);
 
 	if (dev_drv->iommu_enabled) {
@@ -3061,12 +3052,70 @@ static int rk312x_lcdc_resume(struct platform_device *pdev)
 		lcdc_dev->backlight->props.fb_blank = FB_BLANK_UNBLANK;
 		backlight_update_status(lcdc_dev->backlight);
 	}
+}
+
+/*
+ * Bring the panel back on the cold-resume path, before the device tree is
+ * resumed.  The blob only restores DRAM; on a cold warp the LCDC, the LVDS
+ * transmitter and the panel/backlight GPIOs have all lost their state, and
+ * the pinctrl GPIO restore does not run until syscore_resume().
+ */
+void rk312x_lcdc_display_on(void)
+{
+	if (!g_lcdc)
+		return;
+
+	rk_disp_pwr_enable(&g_lcdc->driver);	/* panel power (lcd_cs) */
+	rk312x_lcdc_warp_restore(g_lcdc);
+}
+
+/* capture the live registers, for the /proc display self-test round trip */
+void rk312x_lcdc_display_off_snapshot(void)
+{
+	if (g_lcdc)
+		rk312x_lcdc_warp_save(g_lcdc);
+}
+
+static int rk312x_lcdc_suspend(struct platform_device *pdev, pm_message_t state)
+{
+	struct lcdc_device *lcdc_dev = platform_get_drvdata(pdev);
+	struct rk_lcdc_driver *dev_drv = &lcdc_dev->driver;
+
+	rk312x_lcdc_get_backlight_device(dev_drv);
+	if (lcdc_dev->backlight) {
+		lcdc_dev->backlight->props.fb_blank = FB_BLANK_POWERDOWN;
+		backlight_update_status(lcdc_dev->backlight);
+	}
+
+	if (dev_drv->iommu_enabled) {
+		rockchip_iovmm_deactivate(dev_drv->dev);
+	}
+
+	rk312x_lcdc_warp_save(lcdc_dev);
+
+	if (lcdc_dev->clk_on) {
+		clk_disable_unprepare(lcdc_dev->dclk);
+		clk_disable_unprepare(lcdc_dev->hclk);
+		clk_disable_unprepare(lcdc_dev->aclk);
+		clk_disable_unprepare(lcdc_dev->pd);
+	}
+	g_lcdc_clk_done = 0;
 
 	return 0;
 }
+
+static int rk312x_lcdc_resume(struct platform_device *pdev)
+{
+	rk312x_lcdc_warp_restore(platform_get_drvdata(pdev));
+
+	return 0;
+}
+
 #else
 #define rk312x_lcdc_suspend NULL
 #define rk312x_lcdc_resume  NULL
+void rk312x_lcdc_display_on(void) {}
+void rk312x_lcdc_display_off_snapshot(void) {}
 #endif
 
 static int rk312x_lcdc_remove(struct platform_device *pdev)

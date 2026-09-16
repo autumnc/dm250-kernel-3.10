@@ -864,4 +864,9 @@ extern struct device *rk_fb_get_sysmmu_device_by_compatible(const char *compt);
 extern void rk_fb_platform_set_sysmmu(struct device *sysmmu,
                                       struct device *dev);
 int rk_fb_get_display_policy(void);
+/* early display restore on the warp cold-resume path (see kernel/power/warp.c) */
+extern void rk312x_lcdc_display_on(void);
+extern void rk312x_lcdc_display_off_snapshot(void);
+extern void rk31xx_lvds_display_on(void);
+extern void rk31xx_lvds_display_off_snapshot(void);
 #endif

@@ -194,25 +194,24 @@ static int wifi_init_exit_module(int enable)
 extern void	rkwifi_set_sysif_drv_param( int param );
 	/* => rkwifi/rk_wifi_config.c */
 
-static ssize_t wifi_driver_read(struct class *cls, struct class_attribute *attr, char *_buf)
+/*
+ * Idempotent load/unload of the wifi driver, the same operation the sysfs
+ * `driver` attribute performs.  If the driver is already in the requested
+ * state this is a no-op.  The warp cold-restore path calls it to re-arm wifi
+ * after a real power-off, where calling the raw exit+init pair on a driver
+ * userspace had already unloaded double-frees its sysfs nodes and panics.
+ */
+int rockchip_wifi_driver_set(int enable)
 {
-    int count = sprintf( _buf, "%i", wifi_driver_insmod );
-    return count;
-}
+    int ret = 0;
 
-static ssize_t wifi_driver_write(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
-{
-    int enable = 0, ret = 0;
-    
     down(&driver_sem);
-    enable = simple_strtol(_buf, NULL, 10);
-    //printk("%s: enable = %d\n", __func__, enable);
     if(    ((wifi_driver_insmod == 0) && (enable == 0))
         || ((wifi_driver_insmod != 0) && (enable != 0)) )
     {
         printk("%s: wifi driver already %s\n", __func__, enable? "insmod":"rmmod");
-    	up(&driver_sem);
-        return _count;
+        up(&driver_sem);
+        return 0;
     }
     if(enable > 0) {
         ret = wifi_init_exit_module(enable);
@@ -221,12 +220,27 @@ static ssize_t wifi_driver_write(struct class *cls, struct class_attribute *attr
     } else {
         wifi_init_exit_module(enable);
         wifi_driver_insmod = enable;
-    }   
+    }
     rkwifi_set_sysif_drv_param( wifi_driver_insmod );
 
     up(&driver_sem);
-    //printk("%s: ret = %d\n", __func__, ret);
-    return _count; 
+    return ret;
+}
+EXPORT_SYMBOL(rockchip_wifi_driver_set);
+
+static ssize_t wifi_driver_read(struct class *cls, struct class_attribute *attr, char *_buf)
+{
+    int count = sprintf( _buf, "%i", wifi_driver_insmod );
+    return count;
+}
+
+static ssize_t wifi_driver_write(struct class *cls, struct class_attribute *attr, const char *_buf, size_t _count)
+{
+    int enable = 0;
+
+    enable = simple_strtol(_buf, NULL, 10);
+    rockchip_wifi_driver_set(enable);
+    return _count;
 }
 
 static struct class *rkwifi_class = NULL;

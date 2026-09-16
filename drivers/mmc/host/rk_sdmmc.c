@@ -147,9 +147,16 @@ late_initcall(warp_mmc_proc_init);
  * hangs SDIO I/O until the soft-lockup watchdog panics.  Only the cold warp
  * (halt=1), where the board really powered off and lost the firmware, needs
  * the exit+init reload.
+ *
+ * The reload goes through rockchip_wifi_driver_set(), which is a no-op when
+ * the driver is already in the requested state.  The standard pre-warp
+ * quiesce unloads bcmdhd, and the driver state is part of the restored image,
+ * so after a cold restore the exit half is usually a no-op and only the init
+ * half runs -- which is exactly what re-enumerates the SDIO card and reloads
+ * the firmware.  Calling the raw exit path instead would double-free the
+ * sysfs nodes of an already-unloaded driver and panic.
  * ====================================================================== */
-extern int rockchip_wifi_init_module_rkwifi(void);
-extern void rockchip_wifi_exit_module_rkwifi(void);
+extern int rockchip_wifi_driver_set(int enable);
 
 static void warp_wifi_reinit_workfn(struct work_struct *w)
 {
@@ -163,11 +170,11 @@ static void warp_wifi_reinit_workfn(struct work_struct *w)
 	for (i = 0; i < 400 && pm_device_down != WARP_STATE_NORMAL; i++)
 		msleep(50);
 
-	pr_info("warp: wifi reinit: bcmdhd module reload (settled after %dms)\n", i * 50);
+	pr_info("warp: wifi reinit: bcmdhd reload (settled after %dms)\n", i * 50);
 	msleep(500);
-	rockchip_wifi_exit_module_rkwifi();
+	rockchip_wifi_driver_set(0);
 	msleep(500);
-	rockchip_wifi_init_module_rkwifi();
+	rockchip_wifi_driver_set(1);
 	pr_info("warp: wifi reinit: done\n");
 }
 static DECLARE_WORK(warp_wifi_reinit_work, warp_wifi_reinit_workfn);
