@@ -18,7 +18,6 @@
 #include <linux/version.h>
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
-#include <linux/fb.h>
 #include <linux/warp_param.h>
 #include <linux/workqueue.h>
 #include <asm/uaccess.h>
@@ -27,11 +26,15 @@
  * cold restore; consulted here only for diagnostics */
 extern int warp_pmic_cold_started;
 
-/* implemented by the display drivers; used by the cold-resume checkpoint */
+/* implemented by the display drivers; used by the early display restore */
 extern void rk312x_lcdc_display_on(void);
 extern void rk312x_lcdc_display_off_snapshot(void);
 extern void rk31xx_lvds_display_on(void);
 extern void rk31xx_lvds_display_off_snapshot(void);
+
+/* implemented by drivers/mmc/host/rk_sdmmc.c; queues the post-cold-restore
+ * bcmdhd reload described next to warp_wifi_reinit_work */
+extern void warp_wifi_reinit_schedule(void);
 
 #ifdef CONFIG_MTD
 #undef DEBUG
@@ -1771,6 +1774,52 @@ static void warp_bootflag_clear(void)
 }
 
 /*
+ * Cold-restore marker at p5+0x1f000, in the padding between the warp journal
+ * (0x18000..0x1a000) and the bootflag (0x20000) that nothing else touches.
+ *
+ * A cold warp is a save followed by an ordinary power-off, and the restore
+ * side resumes *inside* that save, at the blob-return point, holding the saved
+ * DRAM -- so both sides run this code with the same memory.  Nothing in DRAM
+ * can tell them apart: halt is cleared before the save (see hibernate()), the
+ * W5BF bootflag is armed on both because U-Boot's automatic restore never
+ * clears it, and warp_pmic_cold_started is always 0 because a soft power-off
+ * does not drop the PMIC's always-on domain.
+ *
+ * What does differ is the save area itself: bytes written after the snapshot
+ * are still there when the restore side runs.  hibernate() clears this marker
+ * before the snapshot, and the save side sets it once the snapshot has
+ * returned -- the restore side resumed before that, so it finds the marker
+ * set and knows it is a replay.
+ */
+#define WARP_COLD_MARK_OFF	0x1f000UL
+static const char warp_cold_mark_magic[8] = "WARPCLD";
+
+static int warp_cold_restore(void)
+{
+	char mark[sizeof(warp_cold_mark_magic)];
+
+	if (warp_jrnl_load(mark, sizeof(mark), WARP_COLD_MARK_OFF) != sizeof(mark))
+		return 0;
+	return memcmp(mark, warp_cold_mark_magic, sizeof(mark)) == 0;
+}
+
+static void warp_cold_mark_set(void)
+{
+	warp_jrnl_store(warp_cold_mark_magic, sizeof(warp_cold_mark_magic),
+			WARP_COLD_MARK_OFF);
+	if (!warp_cold_restore())
+		pr_err("warp: cold-restore marker did not stick at p5+0x%lx -- "
+		       "the restore would not be recognised and W5BF would stay "
+		       "armed\n", WARP_COLD_MARK_OFF);
+}
+
+static void warp_cold_mark_clear(void)
+{
+	warp_jrnl_store(warp_bootflag_zero, sizeof(warp_cold_mark_magic),
+			WARP_COLD_MARK_OFF);
+}
+
+/*
  * Cold-resume flight recorder.
  *
  * A cold warp powers the board off (from userspace; see the note in
@@ -1802,45 +1851,34 @@ static void warp_sr_mark(u32 bit)
 }
 
 /*
- * Cold-resume display checkpoint.
+ * Early display restore.
  *
- * A cold-restored session has no console, no usable network and no
- * persistent scratch medium, so the panel is the only observable output.
- * A colour band is painted across the top of the framebuffer at each stage
- * of the resume path that is still reachable, and the display chain is
- * brought back at the same time, so the band records how far the restorer
- * got without needing a serial port:
+ * A cold restore resumes in a kernel whose panel was really powered off: the
+ * LCDC and LVDS blocks and the panel/backlight GPIOs all lost their state (the
+ * blob restores DRAM only, and the pinctrl GPIO restore does not run until
+ * syscore_resume()).  /proc/warp/earlydisp, or a warp armed with halt=1, asks
+ * the resume path to bring the display chain back right after
+ * local_irq_enable() rather than waiting for the lcdc/lvds platform resume.
  *
- *   (black)         -> hung before local_irq_enable(): the blob hand-off, the
- *                      snapshot.c resume section (CRU/GRF/timer/PMIC/UART),
- *                      or syscore_resume()
- *   0xff0000 red    -> local_irq_enable() reached, display chain restored
- *                      (LCDC + LVDS + backlight)
- *   0xffff00 yellow -> pm_device_resume() returned (devices, incl. SDIO)
- *   0xffffff white  -> whole resume path traversed
- *
- * The display bring-up must NOT move earlier than local_irq_enable(): it
- * takes clocks, a mutex-backed backlight device and possibly an IOVMM
- * activation, all of which may sleep, and the window between
- * local_irq_disable() and local_irq_enable() is atomic.  Doing it there hung
- * the warm warp outright (kernel #130: logo flash, then a dead panel).
- *
- * Painting is enabled only for a warp that was armed as a cold one
- * (warp_param.halt, or /proc/warp/earlydisp), so the default warm warp is
- * left untouched.  A cold warp sets earlydisp before the save, which puts
- * warp_disp_force into the saved image as well, so the restored kernel paints
- * too.  See the cold-warp recipe next to warp_keep_bf.
+ * It must NOT move earlier than local_irq_enable(): it takes clocks, a
+ * mutex-backed backlight device and possibly an IOVMM activation, all of which
+ * may sleep, and the window between local_irq_disable() and local_irq_enable()
+ * is atomic.  Doing it there hung the warm warp outright (kernel #130: logo
+ * flash, then a dead panel).
  */
 int warp_disp_force;		/* /proc/warp/earlydisp */
 
 /*
- * /proc/warp/keepbf: do not clear the W5BF bootflag at the end of the resume
- * path.  This is how a cold warp is set up: a plain save (`echo disk`) writes
- * a W5BF block with a snapshot_id matching the W5S1 image, and U-Boot
- * cold-restores on the next power-on *only* while that block is present.  By
- * default the resume path clears it -- a warm warp must not leave the device
- * set up to warp-boot a session that is already live -- so arming a cold warp
- * means doing a save with this set and then powering off normally.
+ * /proc/warp/keepbf: leave the W5BF bootflag armed at the end of the resume
+ * path.  This is how a cold warp is set up: the save writes a W5BF block with
+ * a snapshot_id matching the W5S1 image, and U-Boot cold-restores on the next
+ * power-on *only* while that block is present.  By default the resume path
+ * clears it -- a warm warp must not leave the device set up to warp-boot a
+ * session that is already live.  A warp armed with halt=1 sets this itself, so
+ * `echo 1 > /proc/warp/halt` is the whole cold-warp request.
+ *
+ * Arming it also arms the cold-restore marker, which is how the restored
+ * session recognises itself, disarms and reloads wifi (warp_cold_restore).
  */
 int warp_keep_bf;		/* /proc/warp/keepbf */
 
@@ -1849,54 +1887,12 @@ int warp_display_early_needed(void)
 	return warp_param.halt || warp_disp_force;
 }
 
-static void warp_disp_paint(u32 color)
-{
-#ifdef CONFIG_FB
-	struct fb_info *info = registered_fb[0];
-	u32 xres, yres, band, x, y;
-	int stride;
-	u32 *p;
-
-	if (!info || !info->screen_base)
-		return;
-	if (info->var.bits_per_pixel != 32)
-		return;
-
-	xres = info->var.xres;
-	yres = info->var.yres;
-	if (!xres || !yres)
-		return;
-
-	stride = info->fix.line_length >> 2;
-	if (stride < (int)xres)
-		return;
-
-	band = yres / 10;
-	if (band < 1)
-		band = 1;
-
-	for (y = 0; y < band; y++) {
-		p = (u32 *)info->screen_base + y * stride;
-		for (x = 0; x < xres; x++)
-			p[x] = color;
-	}
-#else
-	(void)color;
-#endif
-}
-
-void warp_disp_ckpt(u32 color)
-{
-	if (warp_display_early_needed())
-		warp_disp_paint(color);
-}
-
 /*
  * /proc/warp/earlydisp == 2: capture the live display registers and run the
  * restore sequence straight back over them, in normal process context.  A
  * broken register sequence is then caught on a healthy system instead of
- * costing a cold warp.  The band repainted magenta is the "it ran" marker;
- * the rest of the picture staying intact is the "it is correct" marker.
+ * costing a cold warp; the picture staying intact is the "it is correct"
+ * marker.
  */
 void warp_display_selftest(void)
 {
@@ -1904,7 +1900,6 @@ void warp_display_selftest(void)
 	rk31xx_lvds_display_off_snapshot();
 	rk31xx_lvds_display_on();
 	rk312x_lcdc_display_on();
-	warp_disp_paint(0x00ff00ff);
 }
 
 /* Called from the blob-return point in snapshot.c (arch rockchip). */
@@ -1937,6 +1932,11 @@ int hibernate(void)
     /* start a fresh resume journal for this warp run */
     warp_journal_clear();
     warp_journal("hib-entry");
+
+    /* clear the cold-restore marker: whichever side comes back after the
+     * snapshot, only a save that armed W5BF may re-set it (see
+     * warp_cold_restore) */
+    warp_cold_mark_clear();
 
     /* start a fresh cold-resume trace (halt counter too: it must be 0 so a
      * restore-side re-run of the halt branch shows up as a second hit) */
@@ -2244,12 +2244,17 @@ int hibernate(void)
      * the `echo disk` path) reports stat=0.  Clearing halt for the call makes
      * it take the plain-save path, which is the one that writes W5BF.
      *
-     * The saved image must not carry halt either: the resume path has three
-     * halt-gated steps (display bring-up, rk818 pre_init, SDIO re-enumeration)
-     * that a cold-restored kernel has to take, and a halt=0 image would skip
-     * them.  The checkpoint painting therefore hangs off warp_disp_force from
-     * here on, because warp_display_early_needed() would otherwise see the
-     * zeroed halt in the restored image and skip the display bring-up.
+     * The saved image must not carry halt either: the resume path has
+     * halt-gated steps (display bring-up, rk818 pre_init, SDIO
+     * re-enumeration) that a cold-restored kernel has to take, and a halt=0
+     * image would skip them.  The display bring-up therefore hangs off
+     * warp_disp_force from here on, because warp_display_early_needed() would
+     * otherwise see the zeroed halt and skip it.  The wifi reload no longer
+     * needs halt at all -- the cold-restore marker drives it (see
+     * warp_cold_restore).
+     *
+     * halt=1 is the whole cold-warp request: it implies keepbf, so the save
+     * leaves W5BF armed for U-Boot with no second knob to set.
      *
      * `cold` is now only informational: it no longer selects a power-off,
      * because hibernate() no longer powers off at all (see below).
@@ -2257,8 +2262,9 @@ int hibernate(void)
     cold = warp_param.halt;
     if (cold) {
         warp_disp_force = 1;
+        warp_keep_bf = 1;
         warp_param.halt = 0;
-        printk(KERN_EMERG "warp: cold warp: halt cleared for save "
+        printk(KERN_EMERG "warp: cold warp: halt cleared for save, keepbf set "
                "(compress=%d switch=%d)\n",
                warp_param.compress, warp_param.switch_mode);
     }
@@ -2316,14 +2322,12 @@ pm_device_power_down_err:
 
     local_irq_enable();
 
-    /* Earliest point where sleeping is legal again.  Bring the panel back and
-     * leave a red band: if this ran, the blob hand-off and the whole
-     * snapshot.c resume section completed.  See the checkpoint comment above
-     * for why this must not move into the IRQs-off window. */
+    /* Earliest point where sleeping is legal again: bring the panel back
+     * before the lcdc/lvds platform resume gets to it.  See the early-display
+     * comment above for why this must not move into the IRQs-off window. */
     if (warp_display_early_needed()) {
         rk31xx_lvds_display_on();
         rk312x_lcdc_display_on();
-        warp_disp_ckpt(0xff0000);	/* red: display chain restored */
     }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27) && \
@@ -2365,7 +2369,6 @@ pm_device_suspend_err:
     pm_device_resume(STATE_RESTORE);
     warp_journal("pm-resume");
     warp_sr_mark(WARP_SR_PM_RESUME);
-    warp_disp_ckpt(0xffff00);		/* yellow: devices restored */
 #ifndef WARP_SUSPEND_ERR_RECOVER
 pm_device_suspend_err:
 #endif
@@ -2430,7 +2433,20 @@ freeze_processes_err:
     warp_journal("live-start");
 
     warp_sr_mark(WARP_SR_BF_CLEAR);
-    if (warp_keep_bf) {
+    if (warp_cold_restore()) {
+        /* Resumed from a U-Boot cold restore.  The image came from a save
+         * that armed W5BF on purpose, and leaving it armed would make the
+         * next power-on restore again -- disarm it and drop the marker so
+         * this is the last replay.  The SDIO card really was powered off and
+         * lost its firmware, so queue the bcmdhd reload that re-enumerates
+         * the card and re-downloads it (see warp_wifi_reinit_work). */
+        warp_cold_mark_clear();
+        warp_bootflag_clear();
+        printk(KERN_EMERG "warp: cold restore -- W5BF disarmed, "
+               "bcmdhd reload queued\n");
+        warp_wifi_reinit_schedule();
+    } else if (warp_keep_bf) {
+        warp_cold_mark_set();
         printk(KERN_EMERG "warp: keepbf set -- W5BF left armed at "
                "p5+0x%lx so U-Boot restores this image on the next power-on\n",
                WARP_BOOTFLAG_OFF);
@@ -2438,7 +2454,6 @@ freeze_processes_err:
     } else {
         warp_bootflag_clear();
     }
-    warp_disp_ckpt(0xffffff);		/* white: full resume path traversed */
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)

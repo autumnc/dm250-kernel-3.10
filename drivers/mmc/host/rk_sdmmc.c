@@ -142,11 +142,16 @@ late_initcall(warp_mmc_proc_init);
  * bcmdhd's suspend parked it -- skip it and every CMD52 times out (-110), and
  * bcmdhd tears the interface down and powers the chip off.
  *
- * The one thing a warm warp (halt=0) must NOT do is reload bcmdhd: the card
- * was never powered down, and tearing the driver down around a live card
- * hangs SDIO I/O until the soft-lockup watchdog panics.  Only the cold warp
- * (halt=1), where the board really powered off and lost the firmware, needs
- * the exit+init reload.
+ * The one thing a warm warp must NOT do is reload bcmdhd: the card was never
+ * powered down, and tearing the driver down around a live card hangs SDIO I/O
+ * until the soft-lockup watchdog panics.  Only a cold restore, where the board
+ * really powered off and lost the firmware, needs the exit+init reload.
+ *
+ * The trigger is warp_wifi_reinit_schedule(), called by warp.c once it has
+ * identified the resume as a cold restore (warp_cold_restore there).  It
+ * cannot be decided here in dw_mci_resume: that runs before the save area can
+ * be read, and the old `warp_param.halt` test no longer works because
+ * hibernate() clears halt before the save so the blob takes its saving path.
  *
  * The reload goes through rockchip_wifi_driver_set(), which is a no-op when
  * the driver is already in the requested state.  The standard pre-warp
@@ -162,11 +167,11 @@ static void warp_wifi_reinit_workfn(struct work_struct *w)
 {
 	int i;
 
-	/* This is queued from dw_mci_resume, which runs inside the warp restore's
-	 * dpm_resume; a workqueue thread starts immediately on another CPU and
-	 * races the rest of the device resume.  Wait until the warp has fully
-	 * finished (warp.c sets pm_device_down back to NORMAL at its very end) so
-	 * the reload runs against a settled bus. */
+	/* This is queued from the tail of warp.c's resume path, just before it
+	 * puts pm_device_down back to NORMAL; a workqueue thread starts
+	 * immediately on another CPU and races the rest of the resume.  Wait
+	 * until the warp has fully finished so the reload runs against a
+	 * settled bus. */
 	for (i = 0; i < 400 && pm_device_down != WARP_STATE_NORMAL; i++)
 		msleep(50);
 
@@ -178,6 +183,15 @@ static void warp_wifi_reinit_workfn(struct work_struct *w)
 	pr_info("warp: wifi reinit: done\n");
 }
 static DECLARE_WORK(warp_wifi_reinit_work, warp_wifi_reinit_workfn);
+
+void warp_wifi_reinit_schedule(void)
+{
+	schedule_work(&warp_wifi_reinit_work);
+}
+EXPORT_SYMBOL(warp_wifi_reinit_schedule);
+#else
+void warp_wifi_reinit_schedule(void) {}
+EXPORT_SYMBOL(warp_wifi_reinit_schedule);
 #endif /* CONFIG_PM_WARP */
 
 #define DW_MCI_FREQ_MAX	50000000//200000000	/* unit: HZ */
@@ -4626,13 +4640,10 @@ int dw_mci_resume(struct dw_mci *host)
 
 	        if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
 			mci_writel(host, INTMASK, host->save_regs.intmask);
-			/* Only a cold warp (halt=1) really powered the board
-			 * off and lost the firmware, so only it needs bcmdhd
-			 * reloaded to re-enumerate the card and re-download.
-			 * The reload is deferred: this runs in the noirq
-			 * resume phase and cannot sleep. */
-			if (pm_device_down == WARP_STATE_RESUME && warp_param.halt)
-				schedule_work(&warp_wifi_reinit_work);
+			/* A cold restore has to reload bcmdhd to re-enumerate
+			 * the card and re-download the firmware; warp.c queues
+			 * that (warp_wifi_reinit_schedule) once it has
+			 * identified the resume as a cold one. */
 			return 0;
 		}
 	}
