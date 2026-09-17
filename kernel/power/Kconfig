@@ -358,7 +358,7 @@ config PM_WARP_DEBUG
 
 config WARP_DIAG
 	bool "Warp diagnostic instrumentation"
-	default y
+	default n
 	depends on PM_WARP
 	---help---
 	  Compiles in the extra corruption/lockup guards added for the DM250
@@ -367,4 +367,14 @@ config WARP_DIAG
 	  monitor).  Turn this off to build a Warp kernel with the diagnostics
 	  removed, e.g. to test whether the diagnostics themselves are the
 	  cause of a corruption.
+
+config RK312X_WDT
+	bool "RK312x hardware watchdog"
+	default y
+	---help---
+	  Minimal watchdog for the RK312x block at 0x2004c000.  Inert until
+	  armed through /proc/wdt, then fed every 500ms (28.8s timeout).  On
+	  this board it is the only automatic recovery from a hibernate save
+	  that hangs, so it is deliberately independent of WARP_DIAG: it stays
+	  in the kernel when the bring-up diagnostics are removed.
 

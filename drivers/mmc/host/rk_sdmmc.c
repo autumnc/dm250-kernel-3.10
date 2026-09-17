@@ -70,70 +70,6 @@
 #define DW_MCI_DMA_THRESHOLD	16
 
 #ifdef CONFIG_PM_WARP
-/* ============================ WARP-DMA =================================
- * Runtime control / validation of the external (PL330) DMA path used by the
- * rk312x SDIO controller.  wlan0 lives on mmc2 (10218000.rksdmmc), whose data
- * transfers are driven by the external PL330 DMAC (see dw_mci_edmac_ops); the
- * eMMC (mmc0) shares that path but a block-layer soak was negative, whereas
- * every network soak (lo included) corrupts -- so the SDIO DMA is the one
- * still-unexcluded writer.  Corruption is diffuse, load-correlated and
- * invisible to CPU-side canaries, which is what a mis-addressed DMA burst
- * looks like.  Writing '1' to /proc/warp_sdio_pio forces PIO on *every* mmc
- * controller (mmc0 eMMC + mmc2 SDIO/wlan0) so the DMA hypothesis can be
- * excluded on all soak-relevant paths at once; it defaults to 0 (DMA), so a
- * reboot always restores the bootable/serving configuration.
- * ====================================================================== */
-int warp_sdio_pio;			/* 0 = normal DMA, 1 = force mmc2 PIO */
-static unsigned long warp_pio_xfers;	/* transfers diverted to PIO */
-static unsigned long warp_dma_len_bad;	/* sg DMA len != blksz*blocks */
-static unsigned long warp_dma_chk;	/* validated DMA transfers */
-static int warp_sdio_pio_announced;
-
-static int warp_sdio_pio_show(struct seq_file *m, void *v)
-{
-	seq_printf(m, "warp_sdio_pio=%d pio_xfers=%lu dma_checked=%lu dma_len_bad=%lu\n",
-		   warp_sdio_pio, warp_pio_xfers, warp_dma_chk, warp_dma_len_bad);
-	return 0;
-}
-
-static int warp_sdio_pio_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, warp_sdio_pio_show, NULL);
-}
-
-static ssize_t warp_sdio_pio_write(struct file *file, const char __user *ubuf,
-				   size_t count, loff_t *ppos)
-{
-	char buf[8];
-
-	if (count == 0)
-		return 0;
-	if (count > sizeof(buf) - 1)
-		count = sizeof(buf) - 1;
-	if (copy_from_user(buf, ubuf, count))
-		return -EFAULT;
-	buf[count] = '\0';
-	warp_sdio_pio = (buf[0] == '1');
-	warp_sdio_pio_announced = 0;
-	pr_emerg("WARP-DMA: warp_sdio_pio -> %d\n", warp_sdio_pio);
-	return count;
-}
-
-static const struct file_operations warp_sdio_pio_fops = {
-	.open		= warp_sdio_pio_open,
-	.read		= seq_read,
-	.write		= warp_sdio_pio_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int __init warp_mmc_proc_init(void)
-{
-	proc_create("warp_sdio_pio", 0644, NULL, &warp_sdio_pio_fops);
-	return 0;
-}
-late_initcall(warp_mmc_proc_init);
-
 /* ============================ WARP-WIFI =================================
  * Every warp drives mmc2 through the vendor's dw_mci_suspend/resume: suspend
  * saves the controller registers, clears INTMASK/RINTSTS and tears DMA down,
@@ -175,12 +111,12 @@ static void warp_wifi_reinit_workfn(struct work_struct *w)
 	for (i = 0; i < 400 && pm_device_down != WARP_STATE_NORMAL; i++)
 		msleep(50);
 
-	pr_info("warp: wifi reinit: bcmdhd reload (settled after %dms)\n", i * 50);
+	pr_debug("warp: wifi reinit: bcmdhd reload (settled after %dms)\n", i * 50);
 	msleep(500);
 	rockchip_wifi_driver_set(0);
 	msleep(500);
 	rockchip_wifi_driver_set(1);
-	pr_info("warp: wifi reinit: done\n");
+	pr_debug("warp: wifi reinit: done\n");
 }
 static DECLARE_WORK(warp_wifi_reinit_work, warp_wifi_reinit_workfn);
 
@@ -806,31 +742,6 @@ static void dw_mci_edmac_start_dma(struct dw_mci *host, unsigned int sg_len)
 		return;
 	}
 
-#ifdef CONFIG_PM_WARP
-	/*
-	 * WARP-DMA: the whole transfer size is blksz*blocks; the DMA engine only
-	 * ever sees the mapped sg list.  If the mapped length disagrees, the
-	 * engine walks past the buffers and scribbles on whatever follows.
-	 */
-	{
-		u32 exp = host->data->blksz * host->data->blocks;
-		u32 tot = 0;
-		struct scatterlist *s;
-		unsigned int i;
-
-		for_each_sg(sgl, s, sg_elems, i)
-			tot += sg_dma_len(s);
-		warp_dma_chk++;
-		if (tot != exp && warp_dma_len_bad < 32) {
-			warp_dma_len_bad++;
-			pr_emerg("WARP-DMA: LEN %s blksz=%u blocks=%u exp=%u sg_tot=%u sg_len=%u dir=%s\n",
-				 mmc_hostname(host->mmc), host->data->blksz,
-				 host->data->blocks, exp, tot, sg_elems,
-				 (host->data->flags & MMC_DATA_WRITE) ? "W" : "R");
-		}
-	}
-#endif
-
 	/* Set external dma config: burst size, burst width*/
 	slave_config.dst_addr = (dma_addr_t)(host->phy_regs + host->data_offset);
 	slave_config.src_addr = slave_config.dst_addr;
@@ -1112,23 +1023,6 @@ static int dw_mci_submit_data_dma(struct dw_mci *host, struct mmc_data *data)
 	u32 temp;
 
 	host->using_dma = 0;
-
-#ifdef CONFIG_PM_WARP
-	/* WARP-DMA: divert controllers to PIO when asked.  Originally mmc2
-	 * (SDIO/wlan0) only; extended to every controller (incl. mmc0 eMMC) so
-	 * the mis-addressed-DMA hypothesis can be excluded on all soak-relevant
-	 * paths at once.  Default 0 (DMA) keeps the box bootable/serving; a
-	 * reboot always restores the DMA configuration. */
-	if (warp_sdio_pio) {
-		if (!warp_sdio_pio_announced) {
-			warp_sdio_pio_announced = 1;
-			pr_emerg("WARP-DMA: all mmc forced to PIO (first: mmc%d)\n",
-				 host->mmc->index);
-		}
-		warp_pio_xfers++;
-		return -ENODEV;
-	}
-#endif
 
 	/* If we don't have a channel, we can't do DMA */
 	if (!host->use_dma)
@@ -4518,7 +4412,7 @@ int dw_mci_suspend(struct dw_mci *host)
 		mci_writel(host, INTMASK, 0);
 
 	        if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
-			dev_info(host->dev, "warp: mmc suspend sdio (%s) vmmc=%s use_dma=%d\n",
+			dev_dbg(host->dev, "warp: mmc suspend sdio (%s) vmmc=%s use_dma=%d\n",
 				 mmc_hostname(host->mmc), host->vmmc ? "yes" : "no",
 				 host->use_dma);
 			if(host->use_dma && host->dma_ops->exit)

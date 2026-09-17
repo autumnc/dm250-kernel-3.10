@@ -556,9 +556,9 @@ static int warp_load_drv(void)
             if ((ret = _warp_load_drv(no, floating_buf, size)) < 0)
                 return ret;
             if (no == 0)
-                printk("Hibernation driver loaded.\n");
+                pr_debug("Hibernation driver loaded.\n");
             else
-                printk("UserAPI driver %d loaded.\n", no - 1);
+                pr_debug("UserAPI driver %d loaded.\n", no - 1);
             warp_param.drv_phys[no] = __pa(floating_buf);
             warp_param.drv_floating[no] = 1;
             warp_flush_icache_range((unsigned long)floating_buf,
@@ -685,7 +685,7 @@ static int warp_work_alloc(void)
     }
     warp_param.hd_savearea = (unsigned long)hd_savearea;
     warp_param.hd_savearea_end = warp_param.hd_savearea + WARP_HD_SAVEAREA_SIZE;
-    printk("Warp HD savearea 0x%p-0x%p\n", hd_savearea,
+    pr_debug("Warp HD savearea 0x%p-0x%p\n", hd_savearea,
            hd_savearea + WARP_HD_SAVEAREA_SIZE);
 
 #ifdef WARP_AMP
@@ -720,7 +720,7 @@ static int warp_work_alloc(void)
                     ((drvsize - 1) >> PAGE_SHIFT) + 1;
             warp_nosave_work_num++;
         }
-        printk("Warp!! driver area 0x%p-0x%p\n", warp_drv_buf,
+        pr_debug("Warp!! driver area 0x%p-0x%p\n", warp_drv_buf,
                warp_drv_buf + drvsize);
     }
 
@@ -742,7 +742,7 @@ static int warp_work_alloc(void)
                 ((WARP_WORK_SIZE - 1) >> PAGE_SHIFT) + 1;
         warp_nosave_work_num++;
         warp_work_size = WARP_WORK_SIZE;
-        printk("Warp work area 0x%p-0x%p\n",
+        pr_debug("Warp work area 0x%p-0x%p\n",
                warp_work, warp_work + warp_work_size);
     }
 
@@ -1278,9 +1278,9 @@ static int warp_shrink_memory(void)
     }
 
     warp_print_meminfo();
-    printk("Drop bdev cache ... ");
+    pr_debug("Drop bdev cache ... ");
     warp_drop_bdev_cache();
-    printk("done\n");
+    pr_debug("done\n");
 
     if (warp_shrink != WARP_SHRINK_NONE) {
 #if LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,18) || \
@@ -1290,7 +1290,7 @@ static int warp_shrink_memory(void)
         else if (warp_shrink == WARP_SHRINK_LIMIT2)
             repeat = WARP_SHRINK_REPEAT3;
 #endif
-        printk("Shrinking memory...  ");
+        pr_debug("Shrinking memory...  ");
         pages_sum = 0;
         threshold_cnt = 0;
         for (i = 0; i < repeat; i++) {
@@ -1303,54 +1303,12 @@ static int warp_shrink_memory(void)
             }
             pages_sum += pages;
         }
-        printk("\bdone (%d pages freed)\n", pages_sum);
+        pr_debug("\bdone (%d pages freed)\n", pages_sum);
     }
     warp_print_meminfo();
 
     warp_shrink = shrink_sav;
     return 0;
-}
-
-/*
- * #109/#110 diagnostic: the blob's halt decision (in the SNAPSHOT entry)
- * returns early unless the word at its *link* address 0xff00ae7c is zero AND
- * the byte at 0xff00a01e (== param+12 == halt, stored at body 0x1500) is
- * nonzero.  The blob is linked at 0xff000000 but loaded at warp_hibdrv_addr,
- * and its body instructions use absolute 0xff00xxxx operands (movw/movt), so
- * its data mirror lives at those absolute addresses, not at warp_hibdrv_addr
- * +offset.  Read both so we can see which location the blob actually touches
- * and which side of the halt test fails on a cold warp.
- */
-static void warp_dbg_blob(const char *tag)
-{
-    char *b = (char *)warp_hibdrv_addr;
-    u32 abs_a01c = 0, abs_ae7c = 0, abs_ae78 = 0, abs_ae3c = 0;
-    long e1, e2, e3, e4;
-
-    if (!b) {
-        pr_emerg("warp: %s blob=NULL\n", tag);
-        return;
-    }
-    e1 = probe_kernel_read(&abs_a01c, (void *)0xff00a01c, 4);
-    e2 = probe_kernel_read(&abs_ae7c, (void *)0xff00ae7c, 4);
-    e3 = probe_kernel_read(&abs_ae78, (void *)0xff00ae78, 4);
-    e4 = probe_kernel_read(&abs_ae3c, (void *)0xff00ae3c, 4);
-
-    pr_emerg("warp: %s hibdrv=%p drvbuf=%p\n", tag,
-             warp_hibdrv_addr, warp_drv_buf);
-    pr_emerg("warp: %s param sw=%d halt=%d cf=%d os=%d sl=%d stat=%d retry=%d\n",
-             tag, warp_param.switch_mode, warp_param.halt, warp_param.compress,
-             warp_param.oneshot, warp_param.silent,
-             warp_param.stat, warp_param.retry);
-    /* body 0x1458/0x145c = movw/movt r8,#0xa000/#0xff00; if the loader
-     * relocated the blob these become load-base-relative and differ. */
-    pr_emerg("warp: %s code[1458]=%08x code[145c]=%08x (unrel=${e30a8000,e34f8f00})\n",
-             tag, *(u32 *)(b + 0x1458), *(u32 *)(b + 0x145c));
-    pr_emerg("warp: %s ABS a01c=%08x(%ld) ae7c=%08x(%ld) ae78=%08x(%ld) ae3c=%08x(%ld)\n",
-             tag, abs_a01c, e1, abs_ae7c, e2, abs_ae78, e3, abs_ae3c, e4);
-    pr_emerg("warp: %s REL a01c=%08x ae7c=%08x ae78=%08x\n", tag,
-             *(u32 *)(b + 0xa01c), *(u32 *)(b + 0xae7c),
-             *(u32 *)(b + 0xae78));
 }
 
 int hibdrv_snapshot(void)
@@ -1365,11 +1323,11 @@ int hibdrv_snapshot(void)
     if ((ret = warp_make_save_table()) < 0)
         return ret;
 
-    printk("dram save %d pages\n", warp_save_pages);
-    printk("maxarea 0x%08x(0x%08x)  lowmem_maxarea 0x%08x(0x%08x)\n",
+    pr_debug("dram save %d pages\n", warp_save_pages);
+    pr_debug("maxarea 0x%08x(0x%08x)  lowmem_maxarea 0x%08x(0x%08x)\n",
            warp_param.maxarea, warp_param.maxsize,
            warp_param.lowmem_maxarea, warp_param.lowmem_maxsize);
-    printk("zonetbl %d  exttbl %d  dramtbl %d\n", warp_param.zonetbl_num,
+    pr_debug("zonetbl %d  exttbl %d  dramtbl %d\n", warp_param.zonetbl_num,
            warp_param.exttbl_num, warp_param.dramtbl_num);
 
     if (warp_ops->progress)
@@ -1402,16 +1360,14 @@ int hibdrv_snapshot(void)
         warp_param.exttbl = __pa(exttbl);
 
         if (warp_param.switch_mode == 0) {
-            printk(KERN_EMERG "warp: drv snapshot req halt=%d compress=%d oneshot=%d silent=%d\n",
+            pr_debug("warp: drv snapshot req halt=%d compress=%d oneshot=%d silent=%d\n",
                    warp_param.halt, warp_param.compress,
                    warp_param.oneshot, warp_param.silent);
-            warp_dbg_blob("pre");
             if ((ret = WARP_DRV_SNAPSHOT(warp_hibdrv_addr,
                                          &warp_param)) == -ECANCELED)
                 warp_canceled = 1;
-            printk(KERN_EMERG "warp: drv snapshot returned ret=%d stat=%d\n",
+            pr_debug("warp: drv snapshot returned ret=%d stat=%d\n",
                    ret, warp_param.stat);
-            warp_dbg_blob("post");
         } else {
             int loadf = 1;
             memset(&warp_boot_param, 0, sizeof(warp_boot_param));
@@ -1504,90 +1460,6 @@ void warp_save_cancel(void)
         if (warp_ops->progress)
             warp_ops->progress(WARP_PROGRESS_CANCEL);
     }
-}
-
-/*
- * Post-restore liveness probe: after a warp image restore (or aborted save),
- * periodically printk a tick into the console-ramoops ring while probing
- * storage read/write/fsync, so a silent post-restore hang can be diagnosed
- * post-mortem without UART: after the next boot, the pstore console-ramoops
- * file shows the last completed stage before the hang.
- */
-#define WARP_LIVE_MAX_TICKS	24
-
-static struct delayed_work warp_live_work;
-static int warp_live_n;
-static struct file *warp_live_filp;
-
-static void warp_live_fn(struct work_struct *w)
-{
-	mm_segment_t oldfs;
-	char buf[64];
-	struct file *filp;
-	loff_t pos;
-	int n, len, ret;
-
-	n = ++warp_live_n;
-	if (n > WARP_LIVE_MAX_TICKS) {
-		pr_info("warp-live: %d ticks, probe stop\n", WARP_LIVE_MAX_TICKS);
-		return;
-	}
-
-	pr_info("warp-live: tick %d read-try\n", n);
-	filp = filp_open("/dev/mmcblk0p5", O_RDONLY, 0);
-	if (IS_ERR(filp)) {
-		pr_info("warp-live: tick %d read-open err %ld\n", n, PTR_ERR(filp));
-	} else {
-		char sect[512];
-		oldfs = get_fs();
-		set_fs(KERNEL_DS);
-		pos = 0;
-		ret = vfs_read(filp, sect, sizeof(sect), &pos);
-		set_fs(oldfs);
-		filp_close(filp, 0);
-		pr_info("warp-live: tick %d read ret=%d head=%08x\n", n, ret,
-			ret == (int)sizeof(sect) ? *(u32 *)sect : 0);
-	}
-
-	if (!warp_live_filp) {
-		oldfs = get_fs();
-		set_fs(KERNEL_DS);
-		warp_live_filp = filp_open("/root/warp-live.log",
-					   O_WRONLY | O_CREAT | O_APPEND, 0600);
-		set_fs(oldfs);
-		if (IS_ERR(warp_live_filp)) {
-			pr_info("warp-live: tick %d open err %ld\n", n, PTR_ERR(warp_live_filp));
-			warp_live_filp = NULL;
-		}
-	}
-	if (warp_live_filp) {
-		pr_info("warp-live: tick %d write-try\n", n);
-		len = snprintf(buf, sizeof(buf), "tick %d\n", n);
-		oldfs = get_fs();
-		set_fs(KERNEL_DS);
-		ret = vfs_write(warp_live_filp, buf, len, &warp_live_filp->f_pos);
-		set_fs(oldfs);
-		if (ret < 0) {
-			pr_info("warp-live: tick %d write err %d\n", n, ret);
-		} else {
-			pr_info("warp-live: tick %d fsync-try\n", n);
-			oldfs = get_fs();
-			set_fs(KERNEL_DS);
-			ret = vfs_fsync(warp_live_filp, 0);
-			set_fs(oldfs);
-			pr_info("warp-live: tick %d fsync ret=%d\n", n, ret);
-		}
-	}
-
-	schedule_delayed_work(&warp_live_work, 5 * HZ);
-}
-
-static void warp_liveness_start(void)
-{
-	INIT_DELAYED_WORK(&warp_live_work, warp_live_fn);
-	warp_live_n = 0;
-	pr_info("warp-live: start\n");
-	schedule_delayed_work(&warp_live_work, HZ);
 }
 
 /*
@@ -1721,7 +1593,7 @@ static void warp_journal(const char *tag)
 
 	warp_jrnl_store(&rec, sizeof(rec),
 			WARP_JRNL_BASE + (loff_t)slot * WARP_JRNL_RECSZ);
-	pr_info("warp-jrnl: %u %s\n", slot, rec.tag);
+	pr_debug("warp-jrnl: %u %s\n", slot, rec.tag);
 }
 
 /*
@@ -1756,13 +1628,13 @@ static void warp_bootflag_dump(const char *when)
 
 	ret = warp_jrnl_load(warp_bootflag_dump_buf,
 			     sizeof(warp_bootflag_dump_buf), WARP_BOOTFLAG_OFF);
-	pr_info("warp-bf: %s ret=%d id=%08x sid=%08x +68=%08x\n",
+	pr_debug("warp-bf: %s ret=%d id=%08x sid=%08x +68=%08x\n",
 		when, ret, w[0], w[1], w[0x68 / 4]);
-	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+	pr_debug("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
 		w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+	pr_debug("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
 		w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
-	pr_info("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
+	pr_debug("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
 		w[24], w[25], w[26], w[27], w[28], w[29], w[30], w[31]);
 }
 
@@ -1930,7 +1802,7 @@ static void warp_display_unblank(void)
 	info->flags &= ~FBINFO_MISC_USEREVENT;
 	console_unlock();
 
-	pr_info("warp: cold restore -- fb0 unblanked\n");
+	pr_debug("warp: cold restore -- fb0 unblanked\n");
 }
 
 /* Called from the blob-return point in snapshot.c (arch rockchip). */
@@ -2065,9 +1937,9 @@ int hibernate(void)
     if (warp_ops->progress)
         warp_ops->progress(WARP_PROGRESS_SYNC);
 
-    printk("Syncing filesystems ... ");
+    pr_debug("Syncing filesystems ... ");
     sys_sync();
-    printk("done.\n");
+    pr_debug("done.\n");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,13) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,21)
@@ -2295,7 +2167,7 @@ int hibernate(void)
         warp_disp_force = 1;
         warp_keep_bf = 1;
         warp_param.halt = 0;
-        printk(KERN_EMERG "warp: cold warp: halt cleared for save, keepbf set "
+        pr_debug("warp: cold warp: halt cleared for save, keepbf set "
                "(compress=%d switch=%d)\n",
                warp_param.compress, warp_param.switch_mode);
     }
@@ -2403,8 +2275,6 @@ pm_device_suspend_err:
 #ifndef WARP_SUSPEND_ERR_RECOVER
 pm_device_suspend_err:
 #endif
-    printk(KERN_INFO "W22-A dpm_resume returned cold_started=%d\n",
-           warp_pmic_cold_started);
     warp_journal("dev-resume");
 
     if (warp_ops->device_resume_late)
@@ -2423,13 +2293,11 @@ warp_device_suspend_early_err:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,19)
     resume_console();
 #endif
-    printk(KERN_INFO "W22-B resume_console returned, calling dpm_complete\n");
     warp_journal("console");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
 dpm_prepare_err:
     dpm_complete(STATE_RESTORE);
-    printk(KERN_INFO "W22-C dpm_complete returned\n");
     warp_journal("dpm-complete");
 
 freeze_kernel_threads_err:
@@ -2453,14 +2321,10 @@ dpm_prepare_err:
 freeze_processes_err:
     if (warp_ops->progress)
         warp_ops->progress(WARP_PROGRESS_THAW);
-    printk(KERN_INFO "W22-D entering thaw_processes\n");
     warp_journal("pre-thaw");
     thaw_processes();
-    printk(KERN_INFO "W22-E thaw_processes returned\n");
     warp_journal("post-thaw");
 
-    warp_liveness_start();
-    printk(KERN_INFO "W22-F liveness scheduled\n");
     warp_journal("live-start");
 
     warp_sr_mark(WARP_SR_BF_CLEAR);
@@ -2473,13 +2337,13 @@ freeze_processes_err:
          * the card and re-downloads it (see warp_wifi_reinit_work). */
         warp_cold_mark_clear();
         warp_bootflag_clear();
-        printk(KERN_EMERG "warp: cold restore -- W5BF disarmed, "
+        pr_debug("warp: cold restore -- W5BF disarmed, "
                "bcmdhd reload queued\n");
         warp_wifi_reinit_schedule();
         warp_display_unblank();
     } else if (warp_keep_bf) {
         warp_cold_mark_set();
-        printk(KERN_EMERG "warp: keepbf set -- W5BF left armed at "
+        pr_debug("warp: keepbf set -- W5BF left armed at "
                "p5+0x%lx so U-Boot restores this image on the next power-on\n",
                WARP_BOOTFLAG_OFF);
         warp_bootflag_dump("keepbf");
@@ -2750,11 +2614,11 @@ static ssize_t write_proc_warp_earlydisp(struct file *file,
         return err;
 
     if (val == 2) {
-        printk(KERN_INFO "warp: display self-test (capture + restore)\n");
+        pr_debug("warp: display self-test (capture + restore)\n");
         warp_display_selftest();
     } else {
         warp_disp_force = val;
-        printk(KERN_INFO "warp: early display restore %s\n",
+        pr_debug("warp: early display restore %s\n",
                val ? "forced on" : "off");
     }
 
@@ -2790,7 +2654,7 @@ static ssize_t write_proc_warp_keepbf(struct file *file,
         return err;
 
     warp_keep_bf = val;
-    printk(KERN_INFO "warp: bootflag clear at resume end %s\n",
+    pr_debug("warp: bootflag clear at resume end %s\n",
            val ? "suppressed (keepbf)" : "enabled");
     return count;
 }
@@ -3031,14 +2895,14 @@ static int __init warp_init(void)
     {
         u32 stage = readl_relaxed(WARP_SR_STAGE);
 
-        printk(KERN_INFO "warp-scratch: stage=%08x halt=%u prev_boot=%d\n",
+        pr_debug("warp-scratch: stage=%08x halt=%u prev_boot=%d\n",
                stage & ~WARP_SR_BOOTED,
                readl_relaxed(WARP_SR_HALT),
                !!(stage & WARP_SR_BOOTED));
         writel_relaxed(stage | WARP_SR_BOOTED, WARP_SR_STAGE);
     }
 
-    printk(KERN_INFO "Lineo Warp!! module loaded\n");
+    pr_debug("Lineo Warp!! module loaded\n");
 
     return 0;
 }

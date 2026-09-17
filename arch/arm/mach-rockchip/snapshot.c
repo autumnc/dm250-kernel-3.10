@@ -310,7 +310,7 @@ static int warp_snapshot (void)
 
     /* call hibernation driver */
     ret = hibdrv_snapshot();
-    pr_info("warp-resume: hibdrv call returned ret=%d\n", ret);
+    pr_debug("warp-resume: hibdrv call returned ret=%d\n", ret);
 
     /* VOFF restore */
     asm volatile(
@@ -325,10 +325,10 @@ static int warp_snapshot (void)
         "	isb\n"
         "	cps	0x13\n"
         : : "r" (cntvoff) : "r0", "r1");
-    pr_info("warp-resume: cntvoff restored\n");
+    pr_debug("warp-resume: cntvoff restored\n");
 
     rockchip_smp_prepare_cpus(NR_CPUS);
-    pr_info("warp-resume: smp prepared\n");
+    pr_debug("warp-resume: smp prepared\n");
 
     /* CRU */
 #if 0
@@ -418,7 +418,7 @@ static int warp_snapshot (void)
     writel_relaxed(cru_emmc_con[1], RK_CRU_VIRT + 0x01dc);
     writel_relaxed(0xffff5a5a, RK_CRU_VIRT + 0x01f0);
 #endif
-    pr_info("warp-resume: cru restored\n");
+    pr_debug("warp-resume: cru restored\n");
 
     /* GRF */
     for (i = 0; i < 4; i++) {
@@ -469,7 +469,7 @@ static int warp_snapshot (void)
 #if 0
     writel_relaxed(grf_uoc_status0, RK_GRF_VIRT + 0x2c0);
 #endif
-    pr_info("warp-resume: grf restored\n");
+    pr_debug("warp-resume: grf restored\n");
 
     /* Timer */
     if (cru_clkgate7_con & (1 << 7))
@@ -487,7 +487,7 @@ static int warp_snapshot (void)
     if (cru_clkgate7_con & (1 << 7))
         writel_relaxed(0xffff0000 | cru_clkgate7_con,
                        RK_CRU_VIRT + 0x00d0 + (7 * 4));
-    pr_info("warp-resume: timers restored\n");
+    pr_debug("warp-resume: timers restored\n");
 
 #if 0
     /* PMU */
@@ -506,7 +506,7 @@ static int warp_snapshot (void)
 
     /* PMIC */
     warp_rk818_resume();
-    pr_info("warp-resume: pmic resumed\n");
+    pr_debug("warp-resume: pmic resumed\n");
 
     /* UART */
     for (i = 0; i < 3; i++) {
@@ -547,7 +547,7 @@ static int warp_snapshot (void)
             iounmap(uart_addr);
     }
 
-    pr_info("warp-resume: uart restored, hibdrv ret=%d\n", ret);
+    pr_debug("warp-resume: uart restored, hibdrv ret=%d\n", ret);
     return ret;
 }
 
