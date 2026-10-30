@@ -32,6 +32,7 @@
 #include <linux/regmap.h>
 #include <linux/syscore_ops.h>
 #include <linux/warp_param.h>
+#include <linux/reboot.h>
 
 
 #if 0
@@ -1062,7 +1063,18 @@ void rk818_device_shutdown(void)
 			continue;
 		}
 	}
-	while(1) wfi();
+
+	/*
+	 * Ten tries and the PMIC never cut.  Hanging in wfi() here leaves the
+	 * board powered with every rail up (2026-10-29: 13h, panel lit, ~5Ah
+	 * drained) and there is no backstop -- the watchdog disarms itself on
+	 * SYS_POWER_OFF.  Reset instead: with the W5BF bootflag armed U-Boot
+	 * cold-restores the saved image, and without it the board boots again.
+	 */
+	pr_emerg("rk818: DEV_OFF write failed 10 times, resetting\n");
+	emergency_restart();
+	while (1)
+		wfi();
 }
 EXPORT_SYMBOL_GPL(rk818_device_shutdown);
 
@@ -1296,6 +1308,15 @@ void warp_rk818_resume (void)
 	rk818_reg_write(rk818, CAL_OFFSET_REGH, pm_regs[67]);
 	rk818_reg_write(rk818, CAL_OFFSET_REGL, pm_regs[68]);
 #endif
+  }
+  else
+  {
+	/* Warm warp: the PMIC stayed powered and rk818_resume() deliberately
+	 * leaves it alone, but the save masked both interrupt banks.  Put the
+	 * masks back or the power key / charger interrupts stay dead until
+	 * the next reboot. */
+	rk818_reg_write(rk818, RK818_INT_STS_MSK_REG1, pm_regs[37]);
+	rk818_reg_write(rk818, RK818_INT_STS_MSK_REG2, pm_regs[39]);
   }
 }
 #endif	/* CONFIG_PM_WARP */

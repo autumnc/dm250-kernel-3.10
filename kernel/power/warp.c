@@ -2045,6 +2045,20 @@ int hibernate(void)
         goto warp_device_suspend_err;
     }
 
+    /*
+     * pre_snapshot reads the whole PMIC register bank over i2c
+     * (warp_rk818_suspend).  It has to run before pm_device_power_down:
+     * dpm_suspend_end runs rockchip_i2c_suspend_noirq(), which marks the
+     * controller suspended and puts its pins to sleep, so every transfer
+     * after that either fails with -EIO or burns 200ms in the wait loop.
+     * A failed read is silent here (rk818_i2c_read discards the error), so
+     * the captured registers would silently be zero.
+     */
+    if (warp_ops->pre_snapshot && (ret = warp_ops->pre_snapshot())) {
+        pm_device_down = WARP_STATE_RESUME;
+        goto warp_pre_snapshot_early_err;
+    }
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,21) && \
     LINUX_VERSION_CODE <  KERNEL_VERSION(2,6,30)
     if ((ret = disable_nonboot_cpus())) {
@@ -2066,11 +2080,6 @@ int hibernate(void)
         goto pm_device_power_down_err;
     }
 #endif
-
-    if (warp_ops->pre_snapshot && (ret = warp_ops->pre_snapshot())) {
-        pm_device_down = WARP_STATE_RESUME;
-        goto warp_pre_snapshot_err;
-    }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
     if ((ret = disable_nonboot_cpus())) {
@@ -2245,7 +2254,6 @@ disable_nonboot_cpus_err:
 
     if (warp_ops->post_snapshot)
         warp_ops->post_snapshot();
-warp_pre_snapshot_err:
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
     pm_device_power_up(STATE_RESTORE);
@@ -2262,6 +2270,7 @@ disable_nonboot_cpus_err:
     enable_nonboot_cpus();
 #endif
 
+warp_pre_snapshot_early_err:
     if (warp_ops->device_resume)
         warp_ops->device_resume();
 warp_device_suspend_err:
