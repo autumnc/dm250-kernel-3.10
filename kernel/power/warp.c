@@ -1547,6 +1547,30 @@ static int warp_jrnl_load(void *buf, size_t len, loff_t off)
 	return ret;
 }
 
+/*
+ * Read that must answer from flash, not from the page cache.
+ *
+ * The block-device page cache is ordinary DRAM and rides into the snapshot
+ * with everything else.  Bytes the save side writes after the snapshot (the
+ * cold-restore marker) land on a page whose cached copy in the image is the
+ * pre-write one, so a plain vfs_read on the restore side can answer with stale
+ * zeros even though flash holds the marker.  Whether that page happened to be
+ * reclaimed before the snapshot then decides which branch the restore takes --
+ * a saved image that kept the page misidentifies itself as the live session on
+ * every boot.  Dropping the page first makes the decision depend on flash only.
+ *
+ * Clean pages only: everything here is fsync'd before being read back, and a
+ * dirty page is left alone (the read then still succeeds, just from cache).
+ */
+static int warp_jrnl_load_flash(void *buf, size_t len, loff_t off)
+{
+	if (warp_jrnl_filp)
+		invalidate_mapping_pages(warp_jrnl_filp->f_mapping,
+					 off >> PAGE_SHIFT,
+					 (off + len - 1) >> PAGE_SHIFT);
+	return warp_jrnl_load(buf, len, off);
+}
+
 static void warp_journal_clear(void)
 {
 	mm_segment_t oldfs;
@@ -1626,8 +1650,9 @@ static void warp_bootflag_dump(const char *when)
 	const u32 *w = (const u32 *)warp_bootflag_dump_buf;
 	int ret;
 
-	ret = warp_jrnl_load(warp_bootflag_dump_buf,
-			     sizeof(warp_bootflag_dump_buf), WARP_BOOTFLAG_OFF);
+	ret = warp_jrnl_load_flash(warp_bootflag_dump_buf,
+				   sizeof(warp_bootflag_dump_buf),
+				   WARP_BOOTFLAG_OFF);
 	pr_debug("warp-bf: %s ret=%d id=%08x sid=%08x +68=%08x\n",
 		when, ret, w[0], w[1], w[0x68 / 4]);
 	pr_debug("warp-bf: %s %08x %08x %08x %08x %08x %08x %08x %08x\n", when,
@@ -1640,10 +1665,20 @@ static void warp_bootflag_dump(const char *when)
 
 static void warp_bootflag_clear(void)
 {
+	char bf[4];
+	int ok;
+
 	warp_bootflag_dump("pre-clear");
 	warp_jrnl_store(warp_bootflag_zero, sizeof(warp_bootflag_zero),
 			WARP_BOOTFLAG_OFF);
-	warp_journal("bf-clear");
+	/* The zero write is only half the job: if it never reaches flash, a
+	 * later power-on still finds W5BF armed and restores an image this
+	 * session has moved past.  Read it back from flash and journal the
+	 * outcome ("bf-fail" here is the alarm). */
+	ok = warp_jrnl_load_flash(bf, sizeof(bf), WARP_BOOTFLAG_OFF) ==
+	     (int)sizeof(bf) &&
+	     !memcmp(bf, warp_bootflag_zero, sizeof(bf));
+	warp_journal(ok ? "bf-clear" : "bf-fail");
 }
 
 /*
@@ -1671,19 +1706,27 @@ static int warp_cold_restore(void)
 {
 	char mark[sizeof(warp_cold_mark_magic)];
 
-	if (warp_jrnl_load(mark, sizeof(mark), WARP_COLD_MARK_OFF) != sizeof(mark))
+	if (warp_jrnl_load_flash(mark, sizeof(mark), WARP_COLD_MARK_OFF) !=
+	    (int)sizeof(mark))
 		return 0;
 	return memcmp(mark, warp_cold_mark_magic, sizeof(mark)) == 0;
 }
 
-static void warp_cold_mark_set(void)
+static int warp_cold_mark_set(void)
 {
+	char mark[sizeof(warp_cold_mark_magic)];
+
 	warp_jrnl_store(warp_cold_mark_magic, sizeof(warp_cold_mark_magic),
 			WARP_COLD_MARK_OFF);
-	if (!warp_cold_restore())
+	if (warp_jrnl_load_flash(mark, sizeof(mark), WARP_COLD_MARK_OFF) !=
+	    (int)sizeof(mark) ||
+	    memcmp(mark, warp_cold_mark_magic, sizeof(mark)) != 0) {
 		pr_err("warp: cold-restore marker did not stick at p5+0x%lx -- "
 		       "the restore would not be recognised and W5BF would stay "
 		       "armed\n", WARP_COLD_MARK_OFF);
+		return 0;
+	}
+	return 1;
 }
 
 static void warp_cold_mark_clear(void)
@@ -1815,6 +1858,7 @@ int hibernate(void)
 {
     int ret;
     int cold = 0;
+    int coldq;
 
     if (!warp_ops) {
         printk("Snapshot driver not found.\n");
@@ -2337,7 +2381,12 @@ freeze_processes_err:
     warp_journal("live-start");
 
     warp_sr_mark(WARP_SR_BF_CLEAR);
-    if (warp_cold_restore()) {
+    coldq = warp_cold_restore();
+    /* Record the marker verdict: the bootflag branch below decides whether
+     * the next power-on restores this image, and a wrong verdict is what
+     * turns a good save into a board that powers off on every restore. */
+    warp_journal(coldq ? "coldq-hit" : "coldq-miss");
+    if (coldq) {
         /* Resumed from a U-Boot cold restore.  The image came from a save
          * that armed W5BF on purpose, and leaving it armed would make the
          * next power-on restore again -- disarm it and drop the marker so
@@ -2345,13 +2394,14 @@ freeze_processes_err:
          * lost its firmware, so queue the bcmdhd reload that re-enumerates
          * the card and re-downloads it (see warp_wifi_reinit_work). */
         warp_cold_mark_clear();
+        warp_journal("mark-clr");
         warp_bootflag_clear();
         pr_debug("warp: cold restore -- W5BF disarmed, "
                "bcmdhd reload queued\n");
         warp_wifi_reinit_schedule();
         warp_display_unblank();
     } else if (warp_keep_bf) {
-        warp_cold_mark_set();
+        warp_journal(warp_cold_mark_set() ? "bf-keep" : "bf-nomark");
         pr_debug("warp: keepbf set -- W5BF left armed at "
                "p5+0x%lx so U-Boot restores this image on the next power-on\n",
                WARP_BOOTFLAG_OFF);
