@@ -28,6 +28,7 @@
 #include <linux/netdevice.h>
 #include <linux/sched.h>
 #include <linux/irqflags.h>
+#include <linux/rockchip/pdmark.h>
 
 #include "base.h"
 #include "power/power.h"
@@ -1843,6 +1844,7 @@ void device_shutdown(void)
 {
 	struct device *dev, *parent;
 
+	rk_pd_mark(0x5100);
 	spin_lock(&devices_kset->list_lock);
 	/*
 	 * Walk the devices list backward, shutting down each in turn.
@@ -1866,6 +1868,10 @@ void device_shutdown(void)
 		 */
 		list_del_init(&dev->kobj.entry);
 		spin_unlock(&devices_kset->list_lock);
+
+		/* Names the device whose shutdown is about to run (or whose
+		 * loop body hangs before it); it stays behind if we wedge. */
+		rk_pd_mark(rk_pd_tag(dev_name(dev)));
 
 		/* hold lock to avoid race with probe/release */
 		if (parent)
@@ -1896,7 +1902,9 @@ void device_shutdown(void)
 		spin_lock(&devices_kset->list_lock);
 	}
 	spin_unlock(&devices_kset->list_lock);
+	rk_pd_mark(0x5101);
 	async_synchronize_full();
+	rk_pd_mark(0x5102);
 }
 
 /*

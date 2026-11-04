@@ -83,11 +83,30 @@ static struct map_desc rk312x_io_desc[] __initdata = {
 	RK_DEVICE(RK_PWM_VIRT, RK312X_PWM_PHYS, RK312X_PWM_SIZE),
 };
 
+static char pdch(u32 v)
+{
+	return (v >= 32 && v < 127) ? (char)v : '.';
+}
+
 static void __init rk312x_boot_mode_init(void)
 {
 	u32 flag = readl_relaxed(RK_PMU_VIRT + RK312X_PMU_SYS_REG0);
 	u32 mode = readl_relaxed(RK_PMU_VIRT + RK312X_PMU_SYS_REG1);
 	u32 rst_st = readl_relaxed(RK_CRU_VIRT + RK312X_CRU_GLB_RST_ST);
+
+	/*
+	 * Diagnostic: last step the previous poweroff reached (see
+	 * include/linux/rockchip/pdmark.h).  The PMU scratch keeps it across
+	 * the CRU soft reset the watchdog uses to recover a hung poweroff.
+	 * A printable tag is the device device_shutdown() was on.
+	 */
+	{
+		u32 m = readl_relaxed(RK_PMU_VIRT + RK312X_PMU_SYS_REG3);
+
+		pr_emerg("pdmark: last=0x%08x [%c%c%c%c]\n", m,
+			 pdch((m >> 24) & 0xff), pdch((m >> 16) & 0xff),
+			 pdch((m >> 8) & 0xff), pdch(m & 0xff));
+	}
 
 	if (flag == (SYS_KERNRL_REBOOT_FLAG | BOOT_RECOVER))
 		mode = BOOT_MODE_RECOVERY;

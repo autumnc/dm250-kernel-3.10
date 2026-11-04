@@ -64,6 +64,7 @@
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
+#include <linux/rockchip/pdmark.h>
 #ifdef CONFIG_ARCH_ROCKCHIP
 #include <asm/system_misc.h>
 #endif
@@ -415,11 +416,15 @@ EXPORT_SYMBOL_GPL(kernel_restart);
 
 static void kernel_shutdown_prepare(enum system_states state)
 {
+	rk_pd_mark(0x5010);
 	blocking_notifier_call_chain(&reboot_notifier_list,
 		(state == SYSTEM_HALT)?SYS_HALT:SYS_POWER_OFF, NULL);
+	rk_pd_mark(0x5011);
 	system_state = state;
 	usermodehelper_disable();
+	rk_pd_mark(0x5012);
 	device_shutdown();
+	rk_pd_mark(0x5013);
 }
 /**
  *	kernel_halt - halt the system
@@ -445,13 +450,17 @@ EXPORT_SYMBOL_GPL(kernel_halt);
  */
 void kernel_power_off(void)
 {
+	rk_pd_mark(0x5001);
 	kernel_shutdown_prepare(SYSTEM_POWER_OFF);
+	rk_pd_mark(0x5002);
 	if (pm_power_off_prepare)
 		pm_power_off_prepare();
 	migrate_to_reboot_cpu();
 	syscore_shutdown();
+	rk_pd_mark(0x5003);
 	printk(KERN_EMERG "Power down.\n");
 	kmsg_dump(KMSG_DUMP_POWEROFF);
+	rk_pd_mark(0x5004);
 	machine_power_off();
 #ifdef CONFIG_ARCH_ROCKCHIP
 	arm_pm_restart('h', "charge");

@@ -33,6 +33,7 @@
 #include <linux/syscore_ops.h>
 #include <linux/warp_param.h>
 #include <linux/reboot.h>
+#include <linux/rockchip/pdmark.h>
 
 
 #if 0
@@ -1034,10 +1035,14 @@ static void rk818_shutdown(void)
 	int ret;
 	struct rk818 *rk818 = g_rk818;
 
+	rk_pd_mark(0x5301);
 	pr_info("%s\n", __func__);
 	ret = rk818_set_bits(rk818, RK818_INT_STS_MSK_REG1,(0x3<<5),(0x3<<5)); //close rtc int when power off
+	rk_pd_mark(0x5302);
 	ret = rk818_clear_bits(rk818, RK818_RTC_INT_REG,(0x3<<2)); //close rtc int when power off
+	rk_pd_mark(0x5303);
 	mutex_lock(&rk818->io_lock);
+	rk_pd_mark(0x5304);
 	mdelay(100);
 }
 
@@ -1051,7 +1056,9 @@ void rk818_device_shutdown(void)
 	u8 reg = 0;
 	struct rk818 *rk818 = g_rk818;
 
+	rk_pd_mark(0x5400);
 	for (i = 0; i < 10; i++) {
+		rk_pd_mark(0x5410 + i);
 		pr_info("%s\n", __func__);
 		ret = rk818_i2c_read(rk818, RK818_DEVCTRL_REG, 1, &reg);
 		if (ret < 0)
@@ -1064,6 +1071,7 @@ void rk818_device_shutdown(void)
 		}
 	}
 
+	rk_pd_mark(0x5430);
 	/*
 	 * Ten tries and the PMIC never cut.  Hanging in wfi() here leaves the
 	 * board powered with every rail up (2026-10-29: 13h, panel lit, ~5Ah

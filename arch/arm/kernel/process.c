@@ -33,6 +33,7 @@
 #include <linux/cpuidle.h>
 #include <linux/leds.h>
 #include <linux/console.h>
+#include <linux/rockchip/pdmark.h>
 
 #include <asm/cacheflush.h>
 #include <asm/idmap.h>
@@ -270,11 +271,16 @@ void machine_halt(void)
  */
 void machine_power_off(void)
 {
+	rk_pd_mark(0x5500);
 	local_irq_disable();
+	rk_pd_mark(0x5501);
 	smp_send_stop();
+	rk_pd_mark(0x5502);
 
-	if (pm_power_off)
+	if (pm_power_off) {
+		rk_pd_mark(0x5503);
 		pm_power_off();
+	}
 }
 
 /*
@@ -290,14 +296,18 @@ void machine_power_off(void)
  */
 void machine_restart(char *cmd)
 {
+	rk_pd_mark(0x5510);
 	local_irq_disable();
 	smp_send_stop();
+	rk_pd_mark(0x5511);
 
 	/* Flush the console to make sure all the relevant messages make it
 	 * out to the console drivers */
 	arm_machine_flush_console();
+	rk_pd_mark(0x5512);
 
 	arm_pm_restart(reboot_mode, cmd);
+	rk_pd_mark(0x5513);
 
 	/* Give a grace period for failure to restart of 1s */
 	mdelay(1000);

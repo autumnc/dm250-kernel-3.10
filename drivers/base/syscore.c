@@ -10,6 +10,7 @@
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/interrupt.h>
+#include <linux/rockchip/pdmark.h>
 
 static LIST_HEAD(syscore_ops_list);
 static DEFINE_MUTEX(syscore_ops_lock);
@@ -114,6 +115,7 @@ void syscore_shutdown(void)
 {
 	struct syscore_ops *ops;
 
+	rk_pd_mark(0x5300);
 	mutex_lock(&syscore_ops_lock);
 
 	list_for_each_entry_reverse(ops, &syscore_ops_list, node)
@@ -123,5 +125,6 @@ void syscore_shutdown(void)
 			ops->shutdown();
 		}
 
+	rk_pd_mark(0x5305);
 	mutex_unlock(&syscore_ops_lock);
 }

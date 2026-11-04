@@ -28,11 +28,22 @@
  *    why the previous truncation lost everything.
  *  - The reboot notifier disarms on orderly shutdown, so a clean reboot does
  *    not read back as "Boot mode: WATCHDOG".
+ *
+ * Deadman: the shutdown recorder writes a number of seconds to the `deadman`
+ * parameter when stage 3 starts.  Feeding then stops by itself once that timer
+ * runs out, no matter where the shutdown wedges -- userspace sync() in the
+ * halt binary, a reboot notifier, device_shutdown, or syscore.  A healthy
+ * stage 3 finishes in seconds, so the timer must outlive the whole poweroff
+ * path, not the other way round.  This is the only backstop that does not need
+ * userspace to stay schedulable: the 2026-11-03 15:01 freeze completed stage 3
+ * and then sat with the feeder alive, and the 600s userspace fallback never
+ * got as far as stopping it.
  */
 
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/jiffies.h>
 #include <asm/div64.h>
 #include <linux/io.h>
 #include <linux/clk.h>
@@ -47,6 +58,7 @@
 #include <linux/notifier.h>
 #include <linux/kdebug.h>
 #include <linux/reboot.h>
+#include <linux/rockchip/pdmark.h>
 
 #define WDT_PHYS	0x2004c000
 #define WDT_CR		0x00
@@ -75,6 +87,40 @@ static int petting = 1;
 
 module_param(petting, int, 0644);
 MODULE_PARM_DESC(petting, "0 stops feeding the watchdog (forces a reset once armed)");
+
+static int deadman;
+static unsigned long deadman_deadline;
+static bool deadman_expired;
+
+/*
+ * Write N (seconds) to keep feeding for N more seconds and then stop, or 0 to
+ * cancel.  The deadline is kernel jiffies, so userspace wedging after the
+ * write cannot postpone it; jiffies keep advancing as long as any CPU takes
+ * ticks at all.
+ */
+static int deadman_set(const char *val, const struct kernel_param *kp)
+{
+	int ret, secs;
+
+	ret = kstrtoint(val, 0, &secs);
+	if (ret)
+		return ret;
+	if (secs < 0)
+		return -EINVAL;
+
+	deadman = secs;
+	deadman_expired = false;
+	deadman_deadline = secs ? jiffies + (unsigned long)secs * HZ : 0;
+	return 0;
+}
+
+static struct kernel_param_ops deadman_ops = {
+	.set = deadman_set,
+	.get = param_get_int,
+};
+
+module_param_cb(deadman, &deadman_ops, &deadman, 0644);
+MODULE_PARM_DESC(deadman, "seconds of feeding after write, then stop (0 disables)");
 
 static inline void wdt_w32(u32 v, u32 off)
 {
@@ -156,6 +202,14 @@ static void wdt_arm(void)
 static int wdt_kthread(void *unused)
 {
 	while (!kthread_should_stop()) {
+		if (deadman_deadline && time_after(jiffies, deadman_deadline)) {
+			deadman_deadline = 0;
+			if (!deadman_expired) {
+				deadman_expired = true;
+				pr_emerg("rk312x_wdt: deadman expired, feeding stops\n");
+			}
+			petting = 0;
+		}
 		if (petting && wdt_armed) {
 			wdt_pet();
 			wdt_pets++;
@@ -233,28 +287,76 @@ static struct notifier_block wdt_panic_nb = {
 };
 
 /*
- * Orderly shutdown. Disarm so a clean reboot/halt does not read back as a
+ * Orderly restart/halt: disarm so a clean reboot does not read back as a
  * watchdog reset ("Boot mode: WATCHDOG"), which is otherwise indistinguishable
  * from a real crash.
+ *
+ * Poweroff is different: do NOT disarm there.  A cold-restored session can
+ * wedge inside the kernel poweroff path (2026-11-02/03); on those boots the
+ * EN=0 write here does take effect and removes the only automatic backstop,
+ * leaving the board powered with a frozen frame until the user holds the power
+ * key -- and that power cut also wipes the PMU scratch breadcrumbs.  Stopping
+ * the feeder instead leaves the block armed: a healthy poweroff cuts the rails
+ * within seconds, while a wedged one cold-resets ~28s later, and a chip reset
+ * keeps SYS_REG3 for the next boot to print.
+ *
+ * No printk in here, at any level that can reach the console.  2026-11-03
+ * 21:41: a cold-restored poweroff froze with pdmark 0x5600 set and 0x5601
+ * clear, and the watchdog reset ~28s later -- so petting=0 had run and the
+ * very next pr_emerg blocked.  pr_emerg is level 0, which reaches the console
+ * drivers (tty0/fbcon, ttyFIQ0, pstore) whatever console_loglevel says, and
+ * that write is what wedges.  Breadcrumbs go to the PMU instead.
  */
 static int wdt_reboot_notify(struct notifier_block *nb, unsigned long code,
 			     void *unused)
 {
+	rk_pd_mark(0x5600);
+	if (wdt_armed) {
+		/*
+		 * Silence the console for the rest of the shutdown.  The freeze
+		 * moved from our own pr_emerg (#152, pdmark 0x5600) to the core's
+		 * "Power down." printk right after 0x5003 (#153), so any level-0
+		 * console write blocks: the console driver itself is wedged.
+		 * Every driver write goes through call_console_drivers(), which
+		 * drops messages with level >= console_loglevel, so this single
+		 * non-blocking store keeps the rest of the poweroff path away
+		 * from the wedged driver.  The ring buffer and kmsg_dump are
+		 * unaffected; progress is still recorded in pdmark.
+		 */
+		console_silent();
+	}
 	switch (code) {
 	case SYS_DOWN:		/* also SYS_RESTART */
 	case SYS_HALT:
+		if (wdt_armed) {
+			wdt_disarm();
+			rk_pd_mark(0x5603);
+		}
+		break;
 	case SYS_POWER_OFF:
 		if (wdt_armed) {
-			pr_emerg("rk312x_wdt: orderly shutdown, disarming\n");
-			wdt_disarm();
+			/*
+			 * Stop feeding first, and print nothing: whatever wedged
+			 * the shutdown may hold the console, and this notifier is
+			 * the last chance to reach petting at all.
+			 */
+			petting = 0;
+			rk_pd_mark(0x5602);
 		}
 		break;
 	}
+	rk_pd_mark(0x5601);
 	return NOTIFY_DONE;
 }
 
 static struct notifier_block wdt_reboot_nb = {
 	.notifier_call = wdt_reboot_notify,
+	/*
+	 * Run before every other reboot notifier: a wedged one (console, fb,
+	 * a driver's shutdown hook) must not be able to keep the feeder
+	 * running while the rest of the poweroff path is stuck behind it.
+	 */
+	.priority = INT_MAX,
 };
 
 static int wdt_proc_show(struct seq_file *m, void *v)

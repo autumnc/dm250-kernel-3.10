@@ -16,6 +16,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/irqflags.h>
 #include <linux/sched.h>
+#include <linux/rockchip/pdmark.h>
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
@@ -1451,7 +1452,9 @@ static int _mmc_suspend(struct mmc_host *host, bool is_suspend)
 	BUG_ON(!host);
 	BUG_ON(!host->card);
 
+	rk_pd_mark(0x5210);
 	mmc_claim_host(host);
+	rk_pd_mark(0x5211);
 
 	if (mmc_card_suspended(host->card))
 		goto out;
@@ -1474,9 +1477,11 @@ static int _mmc_suspend(struct mmc_host *host, bool is_suspend)
 	else if (!mmc_host_is_spi(host))
 		err = mmc_deselect_cards(host);
 	host->card->state &= ~(MMC_STATE_HIGHSPEED | MMC_STATE_HIGHSPEED_200);
+	rk_pd_mark(0x5212);
 
 	if (!err) {
 		mmc_power_off(host);
+		rk_pd_mark(0x5213);
 		mmc_card_set_suspended(host->card);
 	}
 out:
@@ -1551,6 +1556,7 @@ static int mmc_shutdown(struct mmc_host *host)
 {
 	int err = 0;
 
+	rk_pd_mark(0x5200);
 	/*
 	 * In a specific case for poweroff notify, we need to resume the card
 	 * before we can shutdown it properly.
@@ -1559,6 +1565,7 @@ static int mmc_shutdown(struct mmc_host *host)
 		!(host->caps2 & MMC_CAP2_FULL_PWR_CYCLE)) {
 		err = mmc_resume(host);
 	}
+	rk_pd_mark(0x5201);
 
 	if (!err)
 		err = _mmc_suspend(host, false);
